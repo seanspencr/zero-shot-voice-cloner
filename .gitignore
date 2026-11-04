@@ -1,0 +1,10 @@
+coqui-ai-TTS/*
+checkpoints/*
+datasets/*
+eval_out/*
+vocoder_models/*
+pretrained/*
+*.tar.gz
+logs/*
+.reasonix/*
+samples/*
