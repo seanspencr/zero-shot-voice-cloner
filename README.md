@@ -85,6 +85,7 @@ Two details that explain what you actually hear:
 | `train.py` | Training loop (mock or LibriTTS), Hinge/LSGAN adversarial losses, mel-L1 + feature-matching losses, logging, checkpoints, wav rendering, `--val-every` validation |
 | `metrics.py` | Objective metrics: `mel_cepstral_distortion` (MCD, no weights needed) and `speaker_cosine_similarity` (SECS, needs resemblyzer) |
 | `evaluate.py` | Convert a held-out split with a trained checkpoint and report MCD/SECS; writes wavs + JSON/CSV report |
+| `preview.py` | Convert **one named utterance** next to its reference audio (`ref.wav` + `gen.wav` + meta) for honest A/B listening |
 | `plan.md` | The approved implementation plan (design rationale, contracts, migration path) |
 | `todo.md` | Status, the remaining downloads, open decisions |
 | `datasets/libritts/` | Extracted corpus: `train-clean-100` (33,232 utts / 247 spk), `dev-clean` (5,736 / 40), `test-clean` (4,837 / 39) |
@@ -128,6 +129,24 @@ Corpus facts: LibriTTS speaker ids are **disjoint** across splits (0 overlap tra
 `test-clean` is a genuine unseen-speaker set and `dev-clean` is a clean validation set. Verified run
 (500 utts, batch 8, 4 epochs, 248 steps): `mel L1 1.871 → 0.764`, 4 wavs written at 22.05 kHz.
 
+## Comparing checkpoints by ear (`preview.py`)
+
+Training samples are a *random crop of a random utterance from the last batch*, so two runs never
+produce comparable files. Use this instead — same words, only the voice changes:
+
+```powershell
+python preview.py --checkpoint checkpoints/best.pt --utt-id 1089_134686_000001_000001
+# -> preview/<utt>_ref.wav  (real recording, centre crop)
+#    preview/<utt>_gen.wav  (model conversion of the same crop)
+#    preview/<utt>_meta.json (transcript, crop window, conditioning info)
+
+# zero-shot A->B: content from that utterance, voice from a different enrolment clip
+python preview.py --checkpoint checkpoints/best.pt --utt-id 1089_134686_000001_000001 `
+    --enrollment-utt 1089_134686_000032_000006
+```
+
+Run it per checkpoint with the same `--utt-id` and the comparison is finally meaningful.
+
 ## Evaluation (MCD + SECS)
 
 During training, validate on held-out speakers:
@@ -164,6 +183,9 @@ Result of that command on the 200-step checkpoint above (8 unseen test-clean spe
 | **MCD** (dB, lower better) | Mel-cepstral distortion over `c1..c13` of the log-mel; classic spectral-distance metric. `c0` (loudness) is excluded by design, so pair it with mel-L1 to catch level errors | nothing (numpy/scipy) |
 | **SECS** (higher better) | Cosine similarity between the speaker embedding of the converted audio and the **enrolment** clip. Also reported against the content source, so you can see source-timbre leakage | XTTS v2 speaker encoder (already installed) |
 | mel L1 | Per-frame reconstruction error, kept because MCD is level-blind | nothing |
+
+`report.csv` starts with a `timestamp` column (per item) and the JSON report records the run's
+`timestamp`, `checkpoint`, `split` and `enrollment_mode`, so two runs stay comparable after the fact.
 
 `evaluate.py` defaults to `--enrollment-mode different-utterance`, i.e. the speaker embedding is taken
 from a **different clip of the target speaker** than the content — true zero-shot setup, not the
@@ -266,7 +288,7 @@ error instead of producing mismatched audio.
 | speaker embedding | `[B, 256]`, L2-normalized | `dataset.py`, `MockSpeakerEncoder` |
 | target mel (ground truth) | `[B, 80, T]` | `dataset.py` |
 | predicted mel | `[B, 80, T]` | `Generator` output |
-| discriminator logits | `[B, 1, ceil(80/2^n_layers), ceil(T/2^n_layers)]` → `[B, 1, 5, T/8]` by default | `PatchDiscriminator` |
+| discriminator logits | `[B, 1, ceil(80/2^n_layers), ceil(T/2^n_layers)]` → `[B, 1, 5, T/16]` by default | `PatchDiscriminator` |
 | waveform | `[B, 1, T * hop_length]`, `hop_length=256` for the default checkpoint | `vocoder.py` (`HiFiGANVocoder`) |
 
 **Why there are no shape errors.** The Generator only uses stride-1, same-padded convolutions, so

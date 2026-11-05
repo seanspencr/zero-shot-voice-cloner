@@ -26,6 +26,7 @@ import argparse
 import csv
 import json
 import os
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -242,10 +243,12 @@ def compute_metrics(
     enrollment_mode: str = "same",
     target_speaker: str | None = None,
     progress_every: int = 0,
+    checkpoint: str = "",
 ) -> EvaluationReport:
     """Convert every item in ``dataset`` and aggregate MCD / mel-L1 / (optionally) SECS.
 
-    ``embedder`` is a ``XTTSSpeakerExtractor`` for SECS, or ``None`` to skip it.
+    ``embedder`` is a ``XTTSSpeakerExtractor`` for SECS, or ``None`` to skip it. ``checkpoint`` and the
+    start time are recorded in the report so two runs stay comparable after the fact.
     """
     import soundfile as sf
 
@@ -256,6 +259,7 @@ def compute_metrics(
     if render_dir is not None:
         Path(render_dir).mkdir(parents=True, exist_ok=True)
 
+    started_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     mcds: list[float] = []
     mel_l1s: list[float] = []
     secs_target: list[float] = []
@@ -277,6 +281,7 @@ def compute_metrics(
         mel_l1s.append(mel_l1)
 
         row: dict[str, Any] = {
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "utt_id": utt.utt_id,
             "speaker_id": utt.speaker_id,
             "text": utt.text,
@@ -325,6 +330,10 @@ def compute_metrics(
         mcd_mean=float(np.mean(mcds)) if mcds else float("nan"),
         mcd_std=float(np.std(mcds)) if mcds else float("nan"),
         mel_l1_mean=float(np.mean(mel_l1s)) if mel_l1s else float("nan"),
+        timestamp=started_at,
+        checkpoint=checkpoint,
+        split=dataset.utterances[0].split if dataset.utterances else "",
+        enrollment_mode=enrollment_mode,
         secs_target_mean=float(np.mean(secs_target)) if secs_target else None,
         secs_target_std=float(np.std(secs_target)) if secs_target else None,
         secs_source_mean=float(np.mean(secs_source)) if secs_source else None,
@@ -399,6 +408,7 @@ def main(argv: list[str] | None = None) -> int:
         enrollment_mode=args.enrollment_mode,
         target_speaker=args.target_speaker,
         progress_every=max(1, len(dataset) // 5),
+        checkpoint=args.checkpoint,
     )
     print("Results")
     print(report.summary())

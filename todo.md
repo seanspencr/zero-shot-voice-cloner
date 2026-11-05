@@ -16,7 +16,7 @@ Legend: `[x]` done · `[ ]` needed from you · `[~]` decision needed from you
 | Trainer | **works on real data, end-to-end verified** | First real run: 4 s segments, HuBERT + resemblyzer, 400 utts/epoch, batch 4 → 200 steps in **531.8 s**, `mel L1 2.0475 → 1.0202`, `val MCD 47.411 → 46.238 dB`, 4.01 s wavs rendered, checkpoints saved. Log: `first_run_10min.log`. |
 | Evaluation | **working** | `evaluate.py --require-enrollment` on 8 unseen `test-clean` speakers from that checkpoint: MCD **36.884 dB**, mel L1 0.949, SECS **0.519** vs target / 0.529 vs source. |
 | Validation / metrics | **implemented** | `--val-split dev-clean --val-every N` prints MCD + mel-L1 on held-out speakers during training; `evaluate.py` reports MCD/SECS on a held-out split with wavs + JSON/CSV. MCD needs no weights; **SECS activates once `resemblyzer` is installed** (today it prints "unavailable"). |
-| Checkpoint resume | **not implemented** | `latest.pt` / `best.pt` are written, nothing loads them. |
+| Checkpoint resume | **not implemented** | `latest.pt` / `best.pt` now also store the `SpeakerProbe` and its optimizer (so a checkpoint is a complete training state), but nothing loads them yet. |
 
 ---
 
@@ -125,10 +125,14 @@ plus validation: `--val-split`, `--val-every`, `--val-utterances`.
 ## 4. Decisions taken (this session)
 
 1. `[x]` **Weights** — you place HuBERT and install resemblyzer yourself; paths and URLs are in §1.
-2. `[x]` **Compute** — CPU only. Consequence: work in subsets (`--max-utterances`); a full
-   train-clean-100 epoch is ~75 min at 0.9 steps/s.
-3. `[x]` **Metrics** — MCD + SECS. Implemented in `metrics.py` / `evaluate.py`; SECS starts reporting
-   the moment resemblyzer is installed.
+   *(Update: resemblyzer has since been replaced entirely by XTTS v2's own 512-d speaker encoder.)*
+2. `[x]` **Compute** — CPU only, and now **assessed properly**: the machine has an **NVIDIA Quadro
+   K620** (Maxwell, sm_50, **2048 MiB VRAM with 1638 MiB already used** by the Windows desktop →
+   ~410 MiB free) on driver **452.57** (CUDA 11.0). The pipeline needs ≈850–950 MiB (HuBERT alone is
+   380 MB of weights), so it does not fit; the installed `torch 2.11.0+cpu` has no CUDA support anyway.
+   Consequence: work in subsets (`--max-utterances`); measured ~3.65 s/step at batch 4 / 4 s segments.
+3. `[x]` **Metrics** — MCD + SECS. Implemented in `metrics.py` / `evaluate.py`, with the XTTS speaker
+   encoder used both for conditioning and for SECS.
 
 Still open:
 
@@ -159,6 +163,32 @@ raises if the mel geometry disagrees with the loaded vocoder. `T` is exact: 2.0 
 44,288 samples at 22.05 kHz.
 
 ---
+
+## 5b. Regression report + what changed (latest)
+
+Feedback: the XTTS-encoder + `L_spk` pipeline **sounded worse** than the earlier resemblyzer pipeline,
+even with more data. Findings:
+
+1. **`L_spk` was the likely culprit.** `SpeakerProbe` was fed *raw* log-mel (mean ≈ −9, range −18…+6), so
+   its gradient w.r.t. the generator's mel was large and structured — a generator can satisfy that by
+   producing probe-pleasing artifacts, and the single-scale PatchGAN never punishes them. Both `spk` and
+   `probe` losses fell together, which is the signature of co-adaptation rather than learned timbre.
+2. **Fewer optimizer steps, not fewer data.** Per-step cost rose 2.66 s → 3.65 s, so a 10-minute box gave
+   **150 steps vs 200** before. More utterances per epoch does not compensate.
+3. **Bigger model, unchanged schedule** (G 4.28M → 5.46M params at the same LR/epochs).
+4. **The A/B itself was confounded** — rendered samples were random crops of random utterances.
+
+Changes made:
+
+* `SpeakerProbe` now standardises its input **per sample** (scalar shift/scale, band structure preserved),
+  which keeps the gradient sane without discarding the spectral tilt that carries speaker identity.
+* `--lambda-spk` now defaults to **0** and the probe step is skipped entirely when it is off (also saves
+  CPU time). Enable it later — 0.5–2.0 — once mel-L1 has plateaued.
+* New `preview.py` for identical-content A/B listening across checkpoints.
+* Logs print `spk off` instead of a misleading 0.000.
+
+Available on request: re-adding `--speaker-source resemblyzer` for a three-way ablation
+(old pipeline / XTTS+no-spk / XTTS+spk). It was removed on your instruction, so it is not in the code.
 
 ## 6. Still missing (code, not data)
 

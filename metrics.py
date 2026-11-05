@@ -103,13 +103,25 @@ class EvaluationReport:
     enrollment_fallbacks: int = 0  # items where no other clip of that speaker existed
     per_item: list[dict[str, Any]] = field(default_factory=list)
     n_cepstra: int = MCD_CEPSTRA
+    # provenance: makes two report.csv files comparable at a glance
+    timestamp: str = ""  # ISO-8601, local time, when the evaluation started
+    checkpoint: str = ""
+    split: str = ""
+    enrollment_mode: str = ""
 
     def summary(self) -> str:
-        lines = [
-            f"  utterances           : {self.n_items}",
-            f"  MCD (dB, lower better): {self.mcd_mean:.3f} +/- {self.mcd_std:.3f}   (c1..c{self.n_cepstra})",
-            f"  mel L1 (lower better): {self.mel_l1_mean:.4f}",
-        ]
+        lines = []
+        if self.timestamp:
+            lines.append(f"  run at               : {self.timestamp}")
+        if self.checkpoint:
+            lines.append(f"  checkpoint           : {self.checkpoint}")
+        lines.extend(
+            [
+                f"  utterances           : {self.n_items}",
+                f"  MCD (dB, lower better): {self.mcd_mean:.3f} +/- {self.mcd_std:.3f}   (c1..c{self.n_cepstra})",
+                f"  mel L1 (lower better): {self.mel_l1_mean:.4f}",
+            ]
+        )
         if self.secs_target_mean is not None:
             lines.append(
                 f"  SECS vs target (higher better): {self.secs_target_mean:.3f} +/- {self.secs_target_std:.3f}"

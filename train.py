@@ -138,8 +138,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     optim.add_argument(
         "--lambda-spk",
         type=float,
-        default=1.0,
-        help="weight of the speaker-consistency loss (probe must recover the requested embedding from G's output)",
+        default=0.0,
+        help=(
+            "weight of the speaker-consistency loss (probe must recover the requested embedding from G's "
+            "output). OFF by default: it corrupts audio if enabled before the generator produces "
+            "intelligible mel -- raise it to 0.5-2.0 once mel-L1 has plateaued"
+        ),
     )
     optim.add_argument("--lambda-fm", type=float, default=2.0, help="weight of the feature matching loss")
     optim.add_argument("--seed", type=int, default=1234)
@@ -371,17 +375,27 @@ def save_checkpoint(
     epoch: int,
     generator: nn.Module,
     discriminator: nn.Module,
+    probe: nn.Module,
     opt_g: torch.optim.Optimizer,
     opt_d: torch.optim.Optimizer,
+    opt_p: torch.optim.Optimizer,
     args: argparse.Namespace,
 ) -> None:
+    """Write everything needed to resume or analyse a run.
+
+    The ``SpeakerProbe`` and its optimizer are included on purpose: they are part of the training
+    state (the probe defines ``L_spk``), so a checkpoint without them could not be resumed and the
+    probe's behaviour could not be inspected afterwards.
+    """
     torch.save(
         {
             "epoch": epoch,
             "generator": generator.state_dict(),
             "discriminator": discriminator.state_dict(),
+            "probe": probe.state_dict(),
             "opt_g": opt_g.state_dict(),
             "opt_d": opt_d.state_dict(),
+            "opt_p": opt_p.state_dict(),
             "args": vars(args),
         },
         path,
@@ -505,8 +519,9 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"Generator     : {count_parameters(generator):,} trainable parameters")
     print(f"Discriminator : {count_parameters(discriminator):,} trainable parameters")
+    probe_state = f"lambda_spk={args.lambda_spk}" if args.lambda_spk > 0 else "OFF (--lambda-spk 0)"
     print(f"Speaker probe : {count_parameters(probe):,} trainable parameters "
-          f"(lambda_spk={args.lambda_spk}, embed_dim={args.speaker_dim})")
+          f"({probe_state}, embed_dim={args.speaker_dim})")
     print()
 
     betas = (args.beta1, args.beta2)
@@ -565,12 +580,18 @@ def main(argv: list[str] | None = None) -> int:
             # ---------------- Speaker probe step (on REAL mel only) ----------------
             # The probe learns to recover a speaker embedding from a real spectrogram. Keeping it fed
             # with real data (never G's output) is what stops it from collapsing into "predict whatever
-            # the generator produced".
-            probe_emb_real = probe(mel_target)
-            loss_probe = 1.0 - F.cosine_similarity(probe_emb_real, speaker, dim=-1).mean()
-            opt_p.zero_grad(set_to_none=True)
-            loss_probe.backward()
-            opt_p.step()
+            # the generator produced". Skipped entirely when the loss is off, which also saves the
+            # forward+backward on CPU.
+            if args.lambda_spk > 0.0:
+                probe_emb_real = probe(mel_target)
+                loss_probe = 1.0 - F.cosine_similarity(probe_emb_real, speaker, dim=-1).mean()
+                opt_p.zero_grad(set_to_none=True)
+                loss_probe.backward()
+                opt_p.step()
+                probe_value = loss_probe.item()
+            else:
+                loss_probe = None
+                probe_value = 0.0
 
             # ---------------- Generator step ----------------
             mel_pred = generator(content, speaker)
@@ -587,9 +608,12 @@ def main(argv: list[str] | None = None) -> int:
             )
             # Speaker-consistency loss: the frozen probe must recover the *requested* embedding from
             # the generated spectrogram. Gradients flow into G through the probe's frozen weights.
-            for parameter in probe.parameters():
-                parameter.requires_grad_(False)
-            loss_spk = 1.0 - F.cosine_similarity(probe(mel_pred), speaker, dim=-1).mean()
+            if args.lambda_spk > 0.0:
+                for parameter in probe.parameters():
+                    parameter.requires_grad_(False)
+                loss_spk = 1.0 - F.cosine_similarity(probe(mel_pred), speaker, dim=-1).mean()
+            else:
+                loss_spk = mel_pred.new_zeros(())
             loss_g = (
                 args.lambda_adv * loss_adv
                 + args.lambda_mel * loss_mel
@@ -600,8 +624,9 @@ def main(argv: list[str] | None = None) -> int:
             opt_g.zero_grad(set_to_none=True)
             loss_g.backward()
             opt_g.step()
-            for parameter in probe.parameters():
-                parameter.requires_grad_(True)
+            if args.lambda_spk > 0.0:
+                for parameter in probe.parameters():
+                    parameter.requires_grad_(True)
 
             values = {
                 "d": loss_d.item(),
@@ -610,7 +635,7 @@ def main(argv: list[str] | None = None) -> int:
                 "mel": loss_mel.item(),
                 "fm": loss_fm.item(),
                 "spk": loss_spk.item(),
-                "probe": loss_probe.item(),
+                "probe": probe_value,
                 "d_real": real_logits.mean().item(),
                 "d_fake": fake_logits.mean().item(),
             }
@@ -623,7 +648,9 @@ def main(argv: list[str] | None = None) -> int:
                     f"epoch {epoch:>3}/{args.epochs}  step {step:>4}/{steps_per_epoch}  "
                     f"| D {values['d']:7.4f} (real {values['d_real']:6.3f} fake {values['d_fake']:6.3f})  "
                     f"| G {values['g']:8.4f} (adv {values['adv']:7.4f} mel {values['mel']:.4f} "
-                    f"fm {values['fm']:7.4f} spk {values['spk']:.3f} probe {values['probe']:.3f})"
+                    f"fm {values['fm']:7.4f} "
+                    + (f"spk {values['spk']:.3f} probe {values['probe']:.3f}" if args.lambda_spk > 0 else "spk off")
+                    + ")"
                 )
 
             if args.max_minutes > 0 and (time.perf_counter() - start_time) >= args.max_minutes * 60.0:
@@ -641,7 +668,8 @@ def main(argv: list[str] | None = None) -> int:
         print(
             f"  -> epoch {epoch:>3} summary: D {epoch_stats['d']:.4f} | G {epoch_stats['g']:.4f} "
             f"(adv {epoch_stats['adv']:+.4f}, mel {epoch_stats['mel']:.4f}, fm {epoch_stats['fm']:.4f}, "
-            f"spk {epoch_stats['spk']:.3f}, probe {epoch_stats['probe']:.3f}) "
+            + (f"spk {epoch_stats['spk']:.3f}, probe {epoch_stats['probe']:.3f}" if args.lambda_spk > 0 else "spk off")
+            + ") "
             f"| {steps / elapsed:.1f} steps/s"
         )
 
@@ -707,10 +735,12 @@ def main(argv: list[str] | None = None) -> int:
             )
 
         if save_dir:
-            save_checkpoint(os.path.join(save_dir, "latest.pt"), epoch, generator, discriminator, opt_g, opt_d, args)
+            save_checkpoint(os.path.join(save_dir, "latest.pt"), epoch, generator, discriminator, probe,
+                            opt_g, opt_d, opt_p, args)
             if epoch_stats["g"] < best_g_total:
                 best_g_total = epoch_stats["g"]
-                save_checkpoint(os.path.join(save_dir, "best.pt"), epoch, generator, discriminator, opt_g, opt_d, args)
+                save_checkpoint(os.path.join(save_dir, "best.pt"), epoch, generator, discriminator, probe,
+                                opt_g, opt_d, opt_p, args)
                 print(f"  -> saved best checkpoint (G {best_g_total:.4f}) to {os.path.abspath(save_dir)}")
 
         if stopped_early:
@@ -730,8 +760,11 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  adv loss   : {first['adv']:+.4f} -> {last['adv']:+.4f}")
     print(f"  mel L1     : {first['mel']:.4f} -> {last['mel']:.4f}")
     print(f"  feature mt : {first['fm']:.4f} -> {last['fm']:.4f}")
-    print(f"  spk loss   : {first['spk']:.4f} -> {last['spk']:.4f}   (1 - cos; lower = output carries the target voice)")
-    print(f"  probe loss : {first['probe']:.4f} -> {last['probe']:.4f}")
+    if args.lambda_spk > 0:
+        print(f"  spk loss   : {first['spk']:.4f} -> {last['spk']:.4f}   (1 - cos; lower = output carries the target voice)")
+        print(f"  probe loss : {first['probe']:.4f} -> {last['probe']:.4f}")
+    else:
+        print("  spk loss   : off (--lambda-spk 0); enable it once mel-L1 has plateaued")
     print(f"  D loss     : {first['d']:.4f} -> {last['d']:.4f}")
     print(f"  G loss     : {first['g']:.4f} -> {last['g']:.4f}")
     if rendered:

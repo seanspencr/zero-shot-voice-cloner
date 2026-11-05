@@ -227,6 +227,13 @@ class SpeakerProbe(nn.Module):
     Using an embedding-prediction head (rather than a speaker classifier) means the loss works for
     **unseen** speakers too, which is what zero-shot needs.
 
+    The input is standardised **per sample** (scalar shift + scale over all bins and frames) before the
+    convolutions. Raw log-mel sits around −9 with a range of −18…+6; feeding that to a freshly
+    initialised conv makes the gradient w.r.t. the generator's mel output large and structured, which
+    is what corrupts audio when this loss is switched on early. Standardising keeps the gradient in a
+    sane range *without* removing the spectral tilt that carries speaker identity (a per-band
+    normalisation would have thrown that away).
+
     Shapes:
         input  ``[B, mel_bins, T]``
         output ``[B, embed_dim]``, L2-normalized
@@ -248,7 +255,10 @@ class SpeakerProbe(nn.Module):
     def forward(self, mel: torch.Tensor) -> torch.Tensor:
         if mel.dim() != 3:
             raise ValueError(f"SpeakerProbe expects mel of shape [B, C, T], got {tuple(mel.shape)}")
-        h = self.net(mel)
+        # per-sample standardisation: removes the global log-mel offset/scale, keeps band structure
+        mean = mel.mean(dim=(1, 2), keepdim=True)
+        std = mel.std(dim=(1, 2), keepdim=True) + 1e-5
+        h = self.net((mel - mean) / std)
         pooled = torch.cat([h.mean(dim=2), h.std(dim=2, unbiased=False)], dim=1)
         return torch.nn.functional.normalize(self.proj(pooled), dim=-1)
 
