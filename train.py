@@ -74,6 +74,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     data.add_argument("--split", default="train-clean-100", help="LibriTTS split to train on")
     data.add_argument("--max-utterances", type=int, default=None, help="cap utterance count (smoke runs)")
     data.add_argument(
+        "--cache-dir",
+        default=None,
+        help=(
+            "folder of pre-extracted features (python cache.py ...). Using it removes HuBERT/XTTS/F0 "
+            "from the training loop: ~85%% of the step time on CPU"
+        ),
+    )
+    data.add_argument(
         "--min-seconds",
         type=float,
         default=-1.0,
@@ -479,6 +487,13 @@ def main(argv: list[str] | None = None) -> int:
         print("Corpus:")
         print(split_summary(args.libritts_root))
         min_seconds = args.segment_seconds if args.min_seconds < 0 else args.min_seconds
+        if args.cache_dir:
+            cache_root = Path(args.cache_dir)
+            cached_files = sum(1 for _ in cache_root.rglob("*.npz")) if cache_root.is_dir() else 0
+            if cached_files:
+                print(f"Feature cache : {cache_root} ({cached_files:,} utterances) -- extractors idle")
+            else:
+                print(f"Feature cache : '{cache_root}' has no .npz files; falling back to on-the-fly extraction")
         if min_seconds > 0:
             print(f"Filters       : clips shorter than {min_seconds:g}s are skipped "
                   f"(so segments are never zero-padded; first scan probes every wav header, then caches)")
@@ -494,6 +509,7 @@ def main(argv: list[str] | None = None) -> int:
                 seed=args.seed,
                 train=True,
                 min_seconds=min_seconds,
+                cache_dir=args.cache_dir,
                 content_source=args.content_source,
                 speaker_source=args.speaker_source,
                 content_kwargs={

@@ -17,7 +17,10 @@ Status implementasi (iterasi kedua, sudah dijalankan):
 | 1.5 spectral norm | **selesai** | `PatchDiscriminator(spectral_norm=True)` default; multi-scale D belum |
 | 1.6 L_spk / centering embedding | belum | tetap OFF; urutan sesuai rencana (setelah plateau) |
 | 1.7 LR decay + grad clip | **selesai** | cosine 2e-4 -> 1e-5, `--grad-clip 1.0`, `--grad-accum` tersedia |
-| 2.1 cache fitur | belum | pekerjaan terbesar yang tersisa; wajib untuk 10k+ langkah |
+| 2.1 cache fitur | **selesai** | `cache.py` + `build-cache.bat`. Terukur: **0,4 -> 1,2 steps/s (3x)**
+  dengan loss identik (mel 3,809 -> 3,804). Biaya: 0,90 utt/s, ~1,38 MB/utterance (1.000 utt ~19 min/1,4 GB;
+  5.000 ~93 min/6,9 GB; 12.000 ~3,7 jam/17 GB). Resumable, dan klip tanpa cache otomatis jatuh ke ekstraksi
+  on-the-fly |
 | 2.2 resume | **selesai** | `--resume <ckpt>` memuat G/D/probe + 3 optimizer |
 | 3.x evaluasi & ablation | sebagian | `diagnose.py` + `preview.py` + `evaluate.py` siap dipakai |
 
@@ -211,11 +214,15 @@ Estimasi: 1–2 jam (sebagian besar hanya load model).
 
 ### 2.3 Target skala yang realistis
 
-| Target | Langkah | Perkiraan CPU (setelah cache, ~1 s/langkah) |
+| Target | Langkah | Perkiraan CPU (dengan cache, 0,83 s/langkah terukur) |
 |---|---|---|
-| Bukti kurva belajar | 2.000 | ~35 menit |
-| **Minimum layak laporan** | 10.000 | ~3 jam |
-| Layak dibandingkan literatur | 30.000–50.000 | ~10–14 jam (bisa dibagi 4–5 sesi dengan resume) |
+| Bukti kurva belajar | 2.000 | ~28 menit |
+| **Minimum layak laporan** | 10.000 | **~2,3 jam** |
+| Layak dibandingkan literatur | 30.000–50.000 | ~7–12 jam (dibagi beberapa sesi via `--resume`) |
+
+Konfigurasi optimal yang sekarang dipakai `.bat`: **5.000 ucapan di-cache, 6 epoch** = 7.500 langkah
+≈ 1,7 jam, cache 6,9 GB. Untuk korpus penuh, cache-nya ~46 GB sehingga lebih aman
+`build-cache.bat --max-utterances 12000` (17 GB).
 
 Catatan: dengan GPU sewaan (mis. Colab/T4) 30k langkah bisa ~1–2 jam. Jika tersedia, ini opsi terbaik —
 kode sudah `--device auto`.

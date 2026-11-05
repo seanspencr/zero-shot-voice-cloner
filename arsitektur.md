@@ -49,6 +49,19 @@ Nilai nyata untuk konfigurasi yang dipakai `.bat`: `T = 345` (segment 4.0 s), `B
 
 ---
 
+## 2b. Cache fitur (jalur cepat)
+
+Ekstraksi (HuBERT ~700 ms + XTTS ~250 ms + F0 ~90 ms per ucapan) adalah ~85% waktu per langkah di CPU.
+`cache.py` menyimpannya sekali per ucapan ke `datasets/cache/hubert-L9/<split>/<spk>/<chap>/<utt>.npz`:
+`mel [80,T]` f32, `content [T,768]` **fp16**, `f0 [T,2]` f32, `speaker [512]` f32 (≈1,38 MB/ucapan).
+
+- Pemotongan 4 detik dilakukan **saat baca**, di ruang frame, sehingga tiap epoch tetap memakai jendela
+  acak yang berbeda tanpa ekstraksi ulang.
+- Terukur: **0,4 -> 1,2 steps/s** (3x) dengan loss nyaris identik, karena extractor tidak lagi dipanggil.
+- Fitur cache dihitung pada **seluruh utterance**, bukan pada crop: konteks HuBERT lebih panjang
+  (cos 0,896 terhadap versi crop) dan embedding speaker lebih stabil.
+- Jika sebuah klip belum ada di cache, dataset otomatis kembali ke ekstraksi on-the-fly.
+
 ## 3. Layer input & praproses
 
 ### 3.1 Sumber audio

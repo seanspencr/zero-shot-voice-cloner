@@ -259,8 +259,8 @@ def main(argv: list[str] | None = None) -> int:
                else "pita tinggi relatif terjaga -> plafon bukan di vocoder")
         )
         verdict.append(
-            f"- Energi pita 8-11 kHz: asli {results['real'].get('band_8-11k', float('nan')):.3g}, "
-            f"round-trip {results['roundtrip'].get('band_8-11k', float('nan')):.3g} "
+            f"- Energi pita 8-12 kHz: asli {results['real'].get('band_8-12k', float('nan')):.3g}, "
+            f"round-trip {results['roundtrip'].get('band_8-12k', float('nan')):.3g} "
             "(nilai > 0 hanya mungkin bila mel_fmax > 8000)"
         )
     if "model" in results and "real" in results:
@@ -281,7 +281,8 @@ def main(argv: list[str] | None = None) -> int:
                 f"- Variasi F0: asli {results['real'].get('f0_std_semitones', float('nan')):.3g} semitone vs "
                 f"model {results['model'].get('f0_std_semitones', float('nan')):.3g} -> "
                 + ("intonasi model jauh lebih datar" if results["model"]["f0_std_semitones"] < 0.6 * results["real"]["f0_std_semitones"]
-                   else "kontur intonasi masih wajar")
+                   else ("intonasi model LEBIH goyah dari asli" if results["model"]["f0_std_semitones"] > 1.4 * results["real"]["f0_std_semitones"]
+                         else "kontur intonasi sebanding dengan asli"))
             )
 
     body = f"""# Diagnosis (otomatis dari `diagnose.py`)

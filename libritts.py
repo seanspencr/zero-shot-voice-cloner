@@ -214,6 +214,9 @@ class LibriTTSDataset(Dataset[LibriTTSSample]):
         seed: int = 1234,
         content_extractor: ContentExtractor | None = None,
         speaker_extractor: SpeakerExtractor | None = None,
+        cache_dir: str | Path | None = None,
+        content_source: str = "mel-projection",
+        hubert_layer: int = 9,
     ) -> None:
         if not utterances:
             raise ValueError("no utterances: check the root/split/limit arguments")
@@ -230,6 +233,10 @@ class LibriTTSDataset(Dataset[LibriTTSSample]):
         self.epoch = 0
         self.content_extractor = content_extractor or build_content_extractor("mel-projection")
         self.speaker_extractor = speaker_extractor or build_speaker_extractor("mel-stats")
+        # when a cache is available the extractors are never called at training time
+        self.cache_dir = Path(cache_dir) if cache_dir else None
+        self.content_source = content_source
+        self.hubert_layer = hubert_layer
 
     def set_epoch(self, epoch: int) -> None:
         """Changes the random crop offsets between epochs."""
@@ -237,6 +244,15 @@ class LibriTTSDataset(Dataset[LibriTTSSample]):
 
     def __len__(self) -> int:
         return len(self.utterances)
+
+    def cache_path(self, item: Utterance) -> Path | None:
+        """Path of this utterance's cached features, or ``None`` when caching is off/missing."""
+        if self.cache_dir is None:
+            return None
+        from cache import cache_file
+
+        path = cache_file(self.cache_dir, item.split, item, self.content_source, self.hubert_layer)
+        return path if path.is_file() else None
 
     # ------------------------------------------------------------------ helpers
     def crop_bounds(self, n_samples: int, index: int, sr: int) -> tuple[int, int]:
@@ -280,6 +296,11 @@ class LibriTTSDataset(Dataset[LibriTTSSample]):
         import soundfile as sf
 
         item = self.utterances[index]
+
+        cached = self.cache_path(item)
+        if cached is not None:
+            return self._from_cache(cached, item, index)
+
         wav, sr = sf.read(item.wav_path, dtype="float32", always_2d=False)
         if wav.ndim > 1:  # mono safety: LibriTTS is mono, but be forgiving
             wav = wav.mean(axis=1)
@@ -319,6 +340,60 @@ class LibriTTSDataset(Dataset[LibriTTSSample]):
             duration=total_seconds,
         )
 
+
+    # ------------------------------------------------------------------ cache reader
+    def _from_cache(self, path: Path, item: Utterance, index: int) -> LibriTTSSample:
+        """Serve a sample from the pre-extracted feature cache (no HuBERT / XTTS / F0 at runtime).
+
+        Cropping happens in mel-frame space: the cached tensors cover the whole utterance, and the
+        same random (train) / centre (eval) crop is applied to mel, content and f0 alike, so the frame
+        alignment the Generator relies on is preserved by construction.
+        """
+        import soundfile as sf
+
+        data = np.load(path)
+        mel_full = data["mel"]  # [80, T_full]
+        frames_total = mel_full.shape[1]
+
+        info = sf.info(item.wav_path)
+        sr = info.samplerate
+        seconds = info.frames / sr if sr else 0.0
+        start_sample, end_sample = self.crop_bounds(info.frames, index, sr)
+
+        hop = self.vocoder.hop_length
+        frame_start = int(round(start_sample * self.vocoder.sample_rate / (sr * hop)))
+        if self.segment_seconds is None:
+            n_frames = frames_total
+        else:
+            n_frames = int(round(self.segment_seconds * self.vocoder.sample_rate / hop))
+        frame_start = max(0, min(frame_start, max(0, frames_total - 1)))
+        frame_end = min(frame_start + n_frames, frames_total)
+        take = frame_end - frame_start
+
+        mel = mel_full[:, frame_start:frame_end]
+        content = data["content"][frame_start:frame_end].astype(np.float32)
+        f0 = data["f0"][frame_start:frame_end]
+        speaker = data["speaker"].astype(np.float32)
+
+        # pad to a full segment (only possible for clips shorter than the segment)
+        if take < n_frames:
+            pad = n_frames - take
+            mel = np.pad(mel, ((0, 0), (0, pad)))
+            content = np.pad(content, ((0, pad), (0, 0)))
+            f0 = np.pad(f0, ((0, pad), (0, 0)))
+
+        return LibriTTSSample(
+            content=torch.from_numpy(np.ascontiguousarray(content, dtype=np.float32)),
+            speaker=torch.from_numpy(np.ascontiguousarray(speaker, dtype=np.float32)),
+            mel=torch.from_numpy(np.ascontiguousarray(mel, dtype=np.float32)),
+            f0=torch.from_numpy(np.ascontiguousarray(f0, dtype=np.float32)),
+            utt_id=item.utt_id,
+            text=item.text,
+            crop_start=start_sample / sr if sr else 0.0,
+            crop_end=end_sample / sr if sr else seconds,
+            duration=seconds,
+        )
+
     # ------------------------------------------------------------------ info
     def describe(self) -> str:
         speakers = len({u.speaker_id for u in self.utterances})
@@ -326,7 +401,9 @@ class LibriTTSDataset(Dataset[LibriTTSSample]):
             f"{len(self.utterances)} utterances, {speakers} speakers "
             f"(content: {getattr(self.content_extractor, 'name', '?')}, "
             f"speaker: {getattr(self.speaker_extractor, 'name', '?')}, "
-            f"segment: {'full' if self.segment_seconds is None else f'{self.segment_seconds:g}s'})"
+            f"segment: {'full' if self.segment_seconds is None else f'{self.segment_seconds:g}s'}"
+            + (", cache: on" if self.cache_dir is not None else ", cache: off")
+            + ")"
         )
 
     def validate(self) -> None:
@@ -353,6 +430,7 @@ def build_libritts_loader(
     speaker_kwargs: dict | None = None,
     shuffle_seed: int | None = 0,
     min_seconds: float = 0.0,
+    cache_dir: str | Path | None = None,
 ) -> tuple[LibriTTSDataset, DataLoader[LibriTTSSample]]:
     """Scan a split, build the extractors and wrap everything in a DataLoader.
 
@@ -380,6 +458,9 @@ def build_libritts_loader(
         seed=seed,
         content_extractor=build_content_extractor(content_source, **(content_kwargs or {})),
         speaker_extractor=build_speaker_extractor(speaker_source, **(speaker_kwargs or {})),
+        cache_dir=cache_dir,
+        content_source=content_source,
+        hubert_layer=int((content_kwargs or {}).get("layer", 9)),
     )
 
     shuffle_generator = torch.Generator()
