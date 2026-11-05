@@ -274,7 +274,8 @@ def compute_metrics(
         speaker = sample["speaker"].unsqueeze(0).to(device)
         mel_target = sample["mel"].to(device)
 
-        mel_pred = generator(content, speaker)[0]  # [80, T]
+        f0 = sample["f0"].unsqueeze(0).to(device) if "f0" in sample else None
+        mel_pred = generator(content, speaker, f0)[0]  # [80, T]
         mcd = mel_cepstral_distortion(mel_pred.cpu().numpy(), mel_target.cpu().numpy())
         mel_l1 = float(torch.mean(torch.abs(mel_pred - mel_target)).item())
         mcds.append(mcd)

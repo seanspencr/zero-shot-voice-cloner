@@ -21,6 +21,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from features import F0_FEATURES
+
 __all__ = [
     "AdaIN1d",
     "AdaINResBlock",
@@ -128,8 +130,14 @@ class Generator(nn.Module):
             AdaINResBlock(hidden_dim, speaker_dim) for _ in range(num_blocks)
         )
         self.conv_out = nn.Conv1d(hidden_dim, mel_bins, kernel_size=7, padding=3)
+        # optional pitch stream (log-F0 contour + voiced flag), added to the content projection.
+        # Kept separate from `conv_in` so a checkpoint trained without it still loads.
+        self.f0_proj = nn.Conv1d(F0_FEATURES, hidden_dim, kernel_size=3, padding=1)
 
-    def forward(self, content: torch.Tensor, speaker: torch.Tensor) -> torch.Tensor:
+    def forward(self, content: torch.Tensor, speaker: torch.Tensor, f0: torch.Tensor | None = None) -> torch.Tensor:
+        """``f0`` (optional) is ``[B, T, F0_FEATURES]`` pitch contour; it is projected and added to the
+        content features, which is how the model learns intonation that the AdaIN normalisation would
+        otherwise wash out."""
         if content.dim() != 3:
             raise ValueError(
                 f"Generator expects content of shape [B, T, {self.in_dim}], got {tuple(content.shape)}"
@@ -143,7 +151,17 @@ class Generator(nn.Module):
                 f"Generator expects {self.in_dim}-dim content features, got shape {tuple(content.shape)}"
             )
 
-        h = F.leaky_relu(self.adain_in(self.conv_in(x), speaker), self.slope)
+        h = self.conv_in(x)
+        if f0 is not None:
+            # f0 arrives as [B, T, F0_FEATURES]; decide by the last axis (2 is unambiguous, content
+            # frames are in the hundreds) instead of by size
+            f0_x = f0.transpose(1, 2) if f0.shape[-1] == F0_FEATURES else f0
+            if f0_x.shape[-1] != h.shape[-1]:
+                raise ValueError(
+                    f"Generator: f0 has {f0_x.shape[-1]} frames but content has {h.shape[-1]}"
+                )
+            h = h + self.f0_proj(f0_x)
+        h = F.leaky_relu(self.adain_in(h, speaker), self.slope)
         for block in self.blocks:
             h = block(h, speaker)
         return self.conv_out(h)  # [B, mel_bins, T]
@@ -173,26 +191,33 @@ class PatchDiscriminator(nn.Module):
         n_layers: int = 4,
         in_channels: int = 1,
         slope: float = 0.2,
+        spectral_norm: bool = False,
     ) -> None:
         super().__init__()
         self.mel_bins = mel_bins
         self.slope = slope
 
+        def conv(*args, **kwargs) -> nn.Module:
+            layer = nn.Conv2d(*args, **kwargs)
+            if spectral_norm:
+                layer = torch.nn.utils.parametrizations.spectral_norm(layer)
+            return layer
+
         layers: list[nn.Module] = [
-            nn.Conv2d(in_channels, channels, kernel_size=4, stride=2, padding=1),
+            conv(in_channels, channels, kernel_size=4, stride=2, padding=1),
             nn.LeakyReLU(slope, inplace=True),
         ]
         ch = channels
         for i in range(1, n_layers):
             next_ch = min(ch * 2, 512)
             layers += [
-                nn.Conv2d(ch, next_ch, kernel_size=4, stride=2, padding=1, bias=False),
+                conv(ch, next_ch, kernel_size=4, stride=2, padding=1, bias=False),
                 nn.InstanceNorm2d(next_ch, affine=True),
                 nn.LeakyReLU(slope, inplace=True),
             ]
             ch = next_ch
         # collapse the patch grid to a single validity score per patch
-        layers.append(nn.Conv2d(ch, 1, kernel_size=3, stride=1, padding=1))
+        layers.append(conv(ch, 1, kernel_size=3, stride=1, padding=1))
         self.net = nn.Sequential(*layers)
 
     def forward_features(self, mel: torch.Tensor) -> tuple[torch.Tensor, list[torch.Tensor]]:

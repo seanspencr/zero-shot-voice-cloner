@@ -37,7 +37,13 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
 
-from features import ContentExtractor, SpeakerExtractor, build_content_extractor, build_speaker_extractor
+from features import (
+    ContentExtractor,
+    SpeakerExtractor,
+    build_content_extractor,
+    build_speaker_extractor,
+    f0_from_waveform,
+)
 
 __all__ = [
     "DEFAULT_ROOT",
@@ -73,6 +79,7 @@ class LibriTTSSample(TypedDict):
     content: torch.Tensor  # [T, 768]
     speaker: torch.Tensor  # [D]
     mel: torch.Tensor  # [80, T]
+    f0: torch.Tensor  # [T, 2] log-F0 contour + voiced flag, frames aligned with the mel
     utt_id: str  # source utterance, for traceability
     text: str  # transcript of the source utterance
     crop_start: float  # seconds into the utterance where the converted segment begins
@@ -285,6 +292,12 @@ class LibriTTSDataset(Dataset[LibriTTSSample]):
         mel_np = mel[0].detach().cpu().numpy()
         n_frames = mel_np.shape[-1]
 
+        f0_np = f0_from_waveform(wav, sr, hop_length=self.vocoder.hop_length)  # [T', 2]
+        if f0_np.shape[0] >= n_frames:
+            f0_np = f0_np[:n_frames]
+        else:  # pad the tail so content / f0 / mel all share the same frame count
+            f0_np = np.pad(f0_np, ((0, n_frames - f0_np.shape[0]), (0, 0)))
+
         content = self.content_extractor.extract(wav, sr, mel_np, n_frames)  # [T, 768]
         speaker = self.speaker_extractor.extract(wav, sr, mel_np)  # [D]
 
@@ -298,6 +311,7 @@ class LibriTTSDataset(Dataset[LibriTTSSample]):
             content=torch.from_numpy(np.ascontiguousarray(content, dtype=np.float32)),
             speaker=torch.from_numpy(np.ascontiguousarray(speaker, dtype=np.float32)),
             mel=torch.from_numpy(np.ascontiguousarray(mel_np, dtype=np.float32)),
+            f0=torch.from_numpy(np.ascontiguousarray(f0_np, dtype=np.float32)),
             utt_id=item.utt_id,
             text=item.text,
             crop_start=start / sr,

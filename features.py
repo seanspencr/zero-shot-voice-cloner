@@ -31,6 +31,8 @@ from typing import Any, Protocol
 import numpy as np
 
 __all__ = [
+    "f0_from_waveform",
+    "F0_FEATURES",
     "CONTENT_DIM",
     "SPEAKER_DIM",
     "HUBERT_SR",
@@ -63,6 +65,9 @@ HUBERT_FILES: dict[str, str] = {
     ),
     "pytorch_model.bin": "https://huggingface.co/facebook/hubert-base-ls960/resolve/main/pytorch_model.bin",
 }
+
+#: number of channels the F0 stream contributes to the Generator input
+F0_FEATURES = 2
 
 CONTENT_SOURCES = ("mel-projection", "hubert")
 SPEAKER_SOURCES = ("mel-stats", "xtts")
@@ -107,6 +112,77 @@ def _standardize(x: np.ndarray) -> np.ndarray:
     if x.size == 0:
         return x
     return (x - x.mean()) / (x.std() + 1e-5)
+
+
+def f0_from_waveform(
+    wav: np.ndarray,
+    sr: int,
+    hop_length: int = 256,
+    win_length: int = 512,
+    fmin: float = 60.0,
+    fmax: float = 400.0,
+    stride: int = 4,
+) -> np.ndarray:
+    """Log-F0 + voiced flag, one row per mel frame: ``[T, 2]`` float32.
+
+    Cheapest usable pitch tracker for this pipeline: per-frame **autocorrelation** on the resampled
+    22.05 kHz waveform, vectorised with numpy. ``librosa.pyin`` is far more accurate but costs ~0.5-1 s
+    per 4 s clip, which would dominate a CPU training step; this takes ~10-20 ms.
+
+    The returned pitch is **normalised per utterance** (deviation from the median, in semitones) so the
+    channel carries the *contour* — intonation — and not the speaker's absolute pitch, which would leak
+    identity into what is supposed to be the content path. Silence/unvoiced frames get 0.
+    """
+    import librosa
+
+    x = np.asarray(wav, dtype=np.float32)
+    if x.size < win_length:
+        x = np.pad(x, (0, win_length - x.size))
+    # Frame on the ORIGINAL sample rate (no resampling: autocorrelation is rate-agnostic and the
+    # resample alone cost more than the pitch tracking). The hop is scaled so frames land on the
+    # 22.05 kHz mel grid that the vocoder's AudioProcessor produces.
+    hop_eff = max(1, int(round(hop_length * stride * sr / 22050)))
+    frames = librosa.util.frame(x, frame_length=win_length, hop_length=hop_eff).T
+    frames = frames - frames.mean(axis=1, keepdims=True)
+    windowed = frames * np.hanning(win_length).astype(np.float32)
+    n_fft = 1 << int(np.ceil(np.log2(2 * win_length)))
+    spec = np.fft.rfft(windowed, n=n_fft, axis=1)
+    power = np.abs(spec) ** 2
+
+    min_lag = int(np.floor(sr / fmax))
+    max_lag = int(np.ceil(sr / fmin))
+    ac = np.fft.irfft(power, n=n_fft, axis=1)[:, : max_lag + 1]
+    if ac.shape[1] <= max_lag:
+        ac = np.pad(ac, ((0, 0), (0, max_lag + 1 - ac.shape[1])))
+    eps = 1e-8
+    ac0 = ac[:, :1] + eps
+    norm_ac = ac / ac0  # normalised autocorrelation, 1.0 at lag 0
+
+    lags = np.arange(ac.shape[1])
+    band = (lags >= min_lag) & (lags <= max_lag)
+    search = np.where(band[None, :], norm_ac, -np.inf)
+    best_lag = np.argmax(search, axis=1)
+    best_val = search[np.arange(search.shape[0]), best_lag]
+    voiced = best_val > 0.30  # crude periodicity threshold
+
+    f0 = np.where(voiced, sr / np.maximum(best_lag, 1), 0.0).astype(np.float32)
+    if np.count_nonzero(voiced) > 5:
+        median = float(np.median(f0[voiced]))
+        pitch = np.zeros_like(f0)
+        pitch[voiced] = 12.0 * np.log2(f0[voiced] / max(median, 1e-3))  # semitones around the median
+        pitch = np.clip(pitch, -24.0, 24.0) / 24.0  # scale to [-1, 1]
+    else:
+        pitch = np.zeros_like(f0)
+
+    # repeat each estimate `stride` times so the output lands on the mel frame grid
+    target_frames = int(np.ceil(len(x) / max(1, int(round(hop_length * sr / 22050)))))
+    pitch = np.repeat(pitch, stride)[:target_frames]
+    voiced_out = np.repeat(voiced.astype(np.float32), stride)[:target_frames]
+    if pitch.size < target_frames:  # pad the tail if the frame count is short
+        pad = target_frames - pitch.size
+        pitch = np.pad(pitch, (0, pad))
+        voiced_out = np.pad(voiced_out, (0, pad))
+    return np.stack([pitch, voiced_out], axis=1)  # [T, 2]
 
 
 class ContentExtractor(Protocol):

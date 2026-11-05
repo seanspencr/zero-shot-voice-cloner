@@ -110,6 +110,7 @@ disuntikkan lewat AdaIN.
 
 | Tahap | Operasi | Bentuk |
 |---|---|---|
+| 0 | *(opsional)* `f0_proj: Conv1d(2 → 256, k=3, p=1)` dijumlahkan ke hasil `conv_in`; bobot di-init **nol** sehingga mulanya tidak berpengaruh | `[B, 256, T]` |
 | 1 | `Conv1d(768 → 256, kernel 7, padding 3)` + `AdaIN1d(256)` + `LeakyReLU(0.2)` | `[B, 256, T]` |
 | 2 | **4 × `AdaINResBlock(256)`**: `Conv1d(256→256, k=3, p=1)` → AdaIN → LeakyReLU → `Conv1d` → AdaIN → `+ skip` → LeakyReLU | `[B, 256, T]` |
 | 3 | `Conv1d(256 → 80, kernel 7, padding 3)` — **tanpa aktivasi (linear)** | `[B, 80, T]` |
@@ -138,7 +139,18 @@ y = (1 + scale(z)) · (x − mean_t(x)) / (std_t(x) + ε) + bias(z)      z = spe
   lalu `scale`/`bias` yang bergantung speaker **mengembalikan** timbre target. Content menentukan
   *struktur temporal* (apa yang diucapkan), embedding menentukan *warna suara*.
 
-### 4.2 Fungsi aktivasi yang dipakai
+### 4.2 Stream F0 (prosodi) — ditambahkan pada iterasi kedua
+
+Kanal input tambahan `[B, T, 2]`: **log-F0 ternormalisasi** (deviasi dari median ucapan, semitone, diskalakan
+ke [-1,1]) + **flag voiced**. Diekstrak dengan autokorelasi per frame (`features.f0_from_waveform`,
+~90 ms/klip 4 s), bukan `pyin` yang 5-10x lebih lambat.
+
+*Karena*: normalisasi instance di AdaIN memang membuang statistik per-utterance — termasuk kontur nada —
+dan HuBERT layer 9 makin miskin prosodi. Tanpa kanal eksplisit, intonasi ikut dirata-ratakan sehingga
+terdengar monoton ("zombie"). Normalisasi terhadap median (bukan nilai absolut) penting supaya kanal ini
+membawa **kontur**, bukan identitas pembicara.
+
+### 4.3 Fungsi aktivasi yang dipakai
 
 | Aktivasi | Di mana | Alasan |
 |---|---|---|
@@ -207,15 +219,19 @@ ke sumber 0,558).
 Total loss generator:
 
 ```
-L_G = λ_adv · L_adv + λ_mel · L_L1 + λ_fm · L_fm + λ_spk · L_spk
+L_G = λ_adv · L_adv + λ_mel · L_L1 + λ_detail · L_detail + λ_fm · L_fm + λ_spk · L_spk
 ```
+
+(Diperbarui pada iterasi kedua: `λ_mel` 45 -> **10**, ditambah **L_detail** = multi-scale mel L1 +
+global-variance loss, dan `L_spk` default **0**.)
 
 | Loss | Rumus | Bobot default | Mengapa dipakai |
 |---|---|---|---|
 | **L_adv (G)** — adversarial | `hinge`: `−E[D(fake)]` · `lsgan`: `0.5·E[(D(fake)−1)²]` | `λ_adv = 1.0` | Satu-satunya sinyal "terdengar seperti suara asli". Tanpa ini generator hanya mengejar rata-rata L1 → hasil buram. |
 | **L_D** — adversarial (diskriminator) | `hinge`: `E relu(1−D(real)) + E relu(1+D(fake))` · `lsgan`: `0.5·E[(D(real)−1)²] + 0.5·E[D(fake)²]` | — (hanya untuk D) | Melatih D memberi skor tinggi untuk mel asli dan rendah untuk mel buatan. **Hinge** dipilih sebagai default karena lebih tahan *collapse* di fase awal; **LSGAN** disediakan untuk fase lanjut saat output sudah mirip suara dan tinggal dihaluskan. |
-| **L_L1** — rekonstruksi mel | `E‖mel_pred − mel_target‖₁` | `λ_mel = 45.0` | **Karena** ini satu-satunya loss yang memberi tahu generator "mel yang benar itu seperti apa" per frame; adversarial saja tidak punya target. Bobot besar (45) membuat konvergensi stabil dan konten tidak melenceng. |
+| **L_L1** — rekonstruksi mel | `E‖mel_pred − mel_target‖₁` | `λ_mel = 10.0` (dulu 45) | **Karena** ini satu-satunya loss yang memberi tahu generator "mel yang benar itu seperti apa" per frame; adversarial saja tidak punya target. Namun bobot 45 berasal dari resep **vocoder**; untuk converter ia membuat generator mengejar rata-rata kondisional (blur). Iterasi kedua menurunkannya ke 10 dan memindahkan tekanannya ke L_detail. |
 | **L_fm** — feature matching | `(1/L) Σ_l E‖D_l(fake) − D_l(real)‖₁` (L = 4 peta fitur D) | `λ_fm = 2.0` | **Karena** ia membandingkan *aktivasi diskriminator* untuk mel asli vs buatan: generator diberi target antara yang jauh lebih halus daripada sinyal biner real/fake, sehingga training GAN lebih stabil dan tekstur tidak "lompat-lompat". |
+| **L_detail** — anti-over-smoothing | `multi_scale_mel_loss(1x,2x,4x) + GV` ; `GV = E‖std_t(pred) − std_t(target)‖₁` | `λ_detail = 2.0` | **Karena** L1 satu skala punya minimum trivial: spektrum halus (rata-rata kondisional). Multi-scale menahan envelope kasar *dan* transisi cepat, sedangkan **global variance** menghukum pita yang dinamikanya mengempis — persis mekanisme yang membuat suara "buzzy/robotik". (Alternatif MR-STFT butuh bentuk gelombang; vocoder di dalam loop terlalu mahal di CPU, jadi diterapkan di domain mel.) |
 | **L_spk** — konsistensi speaker | `1 − cos( probe(mel_pred), z_speaker )` | `λ_spk = 0.0` (OFF) | **Karena** ia butuh vektor timbre referensi `z` dan vektor timbre yang terbaca dari output `probe(mel_pred)`; ia menghukum lebih besar kalau timbre output makin jauh dari referensi. Inilah yang memaksa generator benar-benar **memakai** embedding speaker, bukan menyalin timbre input. |
 | **L_probe** — loss probe (saat aktif) | `1 − cos( probe(mel_asli), z_speaker )` | dilatih dengan optimizer sendiri | **Karena** probe harus lebih dulu pandai "membaca timbre dari mel asli"; kalau tidak, L_spk hanya mengejar target yang salah. Probe **hanya** diberi mel asli agar tidak berkolusi dengan generator. |
 
@@ -233,21 +249,24 @@ bergeser demi menyenangkan pihak yang diukur.
 | `lr` | 2e-4 | 2e-4 | 2e-4 |
 | `betas` | (0.5, 0.999) | (0.5, 0.999) | (0.5, 0.999) |
 | `weight_decay` | 0.0 | 0.0 | 0.0 |
-| Scheduler | **tidak ada** (lr konstan) | tidak ada | tidak ada |
+| `grad clip` | 1.0 (norma) | 1.0 | 1.0 |
+| Scheduler | **cosine decay** 2e-4 -> 1e-5 per langkah | idem | idem |
 
 Urutan **per langkah (per batch)**:
 
 1. **Langkah D**: hitung `mel_fake = G(content, speaker).detach()`, `L_D` dari `(mel_target, mel_fake)`,
    lalu `zero_grad → backward → step`.
    *Karena* `detach()`: diskriminator dinilai pada mel yang dianggap konstanta, supaya gradiennya tidak
-   mengalir balik ke generator.
+   mengalir balik ke generator. Diskriminator memakai **spectral normalization** supaya tidak mendominasi
+   saat generator masih lemah.
 2. **Langkah probe** (hanya jika `λ_spk > 0`): `L_probe` dari mel **asli**, optimizer probe.
 3. **Langkah G**: hitung ulang `mel_pred = G(...)` (kali ini dengan graf), `L_G` lengkap, lalu
    `zero_grad → backward → step`. Probe dibekukan pada sub-langkah ini.
 
 `lr = 2e-4` + `beta1 = 0.5` adalah resep GAN yang lazim (momentum rendah, karena gradien adversarial
-berderau). `weight_decay = 0` karena L2 pada bobot GAN cenderung memperlambat konvergensi tanpa manfaat
-yang jelas di skala ini.
+berderau). `weight_decay = 0` karena L2 pada bobot GAN cenderung memperlambat konvergensi tanpa manfaat yang jelas
+di skala ini. LR diturunkan **cosine** sepanjang jadwal (bukan konstan) agar fase akhir training lebih
+halus, dan gradien di-clip pada norma 1.0 karena sinyal adversarial berderau.
 
 ---
 

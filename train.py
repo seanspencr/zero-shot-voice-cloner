@@ -47,6 +47,7 @@ from features import (
 )
 from libritts import DEFAULT_ROOT as DEFAULT_LIBRITTS_ROOT
 from libritts import build_libritts_loader, split_summary
+from losses import SpectralDetailLoss
 from models import Generator, PatchDiscriminator, SpeakerProbe, count_parameters, init_weights
 from vocoder import DEFAULT_MODEL_DIR, HiFiGANVocoder, load_vocoder, missing_checkpoint_help, vocoder_ready
 
@@ -134,7 +135,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="adversarial objective: hinge (early phase, collapse-resistant) or lsgan (late phase, smoothing)",
     )
     optim.add_argument("--lambda-adv", type=float, default=1.0)
-    optim.add_argument("--lambda-mel", type=float, default=45.0, help="weight of the L1 mel reconstruction loss")
+    optim.add_argument(
+        "--lambda-mel",
+        type=float,
+        default=10.0,
+        help=(
+            "weight of the plain L1 mel loss. Was 45 (a *vocoder* recipe); at 45 the reconstruction term "
+            "dominates and the generator converges to a blurred, 'buzzy' average -- see improvement-plan 1.1"
+        ),
+    )
+    optim.add_argument(
+        "--lambda-detail",
+        type=float,
+        default=2.0,
+        help="weight of the anti-over-smoothing term (multi-scale mel + global-variance loss)",
+    )
     optim.add_argument(
         "--lambda-spk",
         type=float,
@@ -146,6 +161,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     optim.add_argument("--lambda-fm", type=float, default=2.0, help="weight of the feature matching loss")
+    optim.add_argument("--lr-min", type=float, default=1e-5, help="cosine-decay floor for the learning rate")
+    optim.add_argument("--grad-clip", type=float, default=1.0, help="max grad norm (0 disables)")
+    optim.add_argument("--grad-accum", type=int, default=1, help="micro-batches per optimizer step")
+    optim.add_argument("--no-spectral-norm", action="store_true", help="disable spectral norm on the discriminator")
+    optim.add_argument("--no-f0", action="store_true", help="do not feed the pitch (F0) stream to the generator")
+    optim.add_argument("--resume", default=None, help="checkpoint to continue from (nothing else is reset)")
     optim.add_argument("--seed", type=int, default=1234)
 
     run = parser.add_argument_group("runtime")
@@ -212,6 +233,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--render-every must be >= 0")
     if args.max_minutes < 0:
         parser.error("--max-minutes must be >= 0")
+    if args.grad_accum < 1:
+        parser.error("--grad-accum must be >= 1")
     if args.val_every < 0:
         parser.error("--val-every must be >= 0")
     if args.val_every > 0 and args.val_split is None:
@@ -511,15 +534,26 @@ def main(argv: list[str] | None = None) -> int:
         speaker_dim=args.speaker_dim,
     ).to(device)
     discriminator = PatchDiscriminator(
-        mel_bins=args.mel_bins, channels=args.d_channels, n_layers=args.d_layers
+        mel_bins=args.mel_bins,
+        channels=args.d_channels,
+        n_layers=args.d_layers,
+        spectral_norm=not args.no_spectral_norm,
     ).to(device)
     generator.apply(init_weights)
     discriminator.apply(init_weights)
+    # the pitch projection starts as a no-op (added to the content path, zero weights)
+    torch.nn.init.zeros_(generator.f0_proj.weight)
+    torch.nn.init.zeros_(generator.f0_proj.bias)
     probe = SpeakerProbe(mel_bins=args.mel_bins, embed_dim=args.speaker_dim).to(device)
 
     print(f"Generator     : {count_parameters(generator):,} trainable parameters")
     print(f"Discriminator : {count_parameters(discriminator):,} trainable parameters")
     probe_state = f"lambda_spk={args.lambda_spk}" if args.lambda_spk > 0 else "OFF (--lambda-spk 0)"
+    print(f"Loss weights  : adv={args.lambda_adv} mel={args.lambda_mel} detail={args.lambda_detail} "
+          f"fm={args.lambda_fm} spk={args.lambda_spk}")
+    print(f"Regularisation: spectral_norm={'off' if args.no_spectral_norm else 'on'} "
+          f"grad_clip={args.grad_clip} grad_accum={args.grad_accum} lr={args.lr}->{args.lr_min} (cosine)")
+    print(f"Pitch stream  : {'off' if args.no_f0 else 'on (log-F0 contour + voiced flag, zero-init projection)'}")
     print(f"Speaker probe : {count_parameters(probe):,} trainable parameters "
           f"({probe_state}, embed_dim={args.speaker_dim})")
     print()
@@ -528,6 +562,21 @@ def main(argv: list[str] | None = None) -> int:
     opt_g = torch.optim.AdamW(generator.parameters(), lr=args.lr, betas=betas, weight_decay=args.weight_decay)
     opt_d = torch.optim.AdamW(discriminator.parameters(), lr=args.lr, betas=betas, weight_decay=args.weight_decay)
     opt_p = torch.optim.AdamW(probe.parameters(), lr=args.lr, betas=betas, weight_decay=args.weight_decay)
+    detail_loss = SpectralDetailLoss()
+
+    if args.resume:
+        state = torch.load(args.resume, map_location="cpu", weights_only=False)
+        generator.load_state_dict(state["generator"])
+        discriminator.load_state_dict(state["discriminator"])
+        if "probe" in state:
+            probe.load_state_dict(state["probe"])
+        opt_g.load_state_dict(state["opt_g"])
+        opt_d.load_state_dict(state["opt_d"])
+        if "opt_p" in state:
+            opt_p.load_state_dict(state["opt_p"])
+        resume_epoch = int(state.get("epoch", 0))
+        print(f"Resumed       : {args.resume} (finished epoch {resume_epoch})")
+        print()
 
     save_dir = args.save_dir.strip() if args.save_dir else ""
     save_dir = "" if save_dir.lower() in ("", "none", "null") else save_dir
@@ -557,8 +606,8 @@ def main(argv: list[str] | None = None) -> int:
     for epoch in range(1, args.epochs + 1):
         dataset.set_epoch(epoch)
         epoch_start = time.perf_counter()
-        sums = {"d": 0.0, "g": 0.0, "adv": 0.0, "mel": 0.0, "fm": 0.0, "spk": 0.0, "probe": 0.0,
-                "d_real": 0.0, "d_fake": 0.0}
+        sums = {"d": 0.0, "g": 0.0, "adv": 0.0, "mel": 0.0, "fm": 0.0, "detail": 0.0, "ms": 0.0,
+                "gv": 0.0, "spk": 0.0, "probe": 0.0, "d_real": 0.0, "d_fake": 0.0}
         steps = 0
 
         for step, batch in enumerate(loader, start=1):
@@ -566,16 +615,21 @@ def main(argv: list[str] | None = None) -> int:
             speaker = batch["speaker"].to(device, non_blocking=True)
             mel_target = batch["mel"].to(device, non_blocking=True)
 
+            f0 = None if args.no_f0 or "f0" not in batch else batch["f0"].to(device, non_blocking=True)
+
             # ---------------- Discriminator step ----------------
             with torch.no_grad():
-                mel_fake = generator(content, speaker)
+                mel_fake = generator(content, speaker, f0)
             fake_logits = discriminator(mel_fake)
             real_logits = discriminator(mel_target)
             loss_d = adversarial_d_loss(real_logits, fake_logits, args.loss)
 
             opt_d.zero_grad(set_to_none=True)
-            loss_d.backward()
-            opt_d.step()
+            (loss_d / args.grad_accum).backward()
+            if step % args.grad_accum == 0 or step == steps_per_epoch:
+                if args.grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(discriminator.parameters(), args.grad_clip)
+                opt_d.step()
 
             # ---------------- Speaker probe step (on REAL mel only) ----------------
             # The probe learns to recover a speaker embedding from a real spectrogram. Keeping it fed
@@ -594,7 +648,7 @@ def main(argv: list[str] | None = None) -> int:
                 probe_value = 0.0
 
             # ---------------- Generator step ----------------
-            mel_pred = generator(content, speaker)
+            mel_pred = generator(content, speaker, f0)
             fake_logits, fake_features = discriminator.forward_features(mel_pred)
             with torch.no_grad():
                 _, real_features = discriminator.forward_features(mel_target)
@@ -606,6 +660,12 @@ def main(argv: list[str] | None = None) -> int:
                 if args.lambda_fm > 0.0
                 else mel_pred.new_zeros(())
             )
+            # anti-over-smoothing: multi-resolution + global-variance terms (improvement-plan 1.1)
+            if args.lambda_detail > 0.0:
+                loss_detail, loss_ms, loss_gv = detail_loss(mel_pred, mel_target)
+            else:
+                loss_detail = mel_pred.new_zeros(())
+                loss_ms = loss_gv = mel_pred.new_zeros(())
             # Speaker-consistency loss: the frozen probe must recover the *requested* embedding from
             # the generated spectrogram. Gradients flow into G through the probe's frozen weights.
             if args.lambda_spk > 0.0:
@@ -617,13 +677,24 @@ def main(argv: list[str] | None = None) -> int:
             loss_g = (
                 args.lambda_adv * loss_adv
                 + args.lambda_mel * loss_mel
+                + args.lambda_detail * loss_detail
                 + args.lambda_fm * loss_fm
                 + args.lambda_spk * loss_spk
             )
 
             opt_g.zero_grad(set_to_none=True)
-            loss_g.backward()
-            opt_g.step()
+            (loss_g / args.grad_accum).backward()
+            if step % args.grad_accum == 0 or step == steps_per_epoch:
+                if args.grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(generator.parameters(), args.grad_clip)
+                opt_g.step()
+                # cosine decay over the whole schedule (steps, not epochs, so --max-minutes still works)
+                progress = min(1.0, (epoch - 1 + step / max(steps_per_epoch, 1)) / max(args.epochs, 1))
+                for opt in (opt_g, opt_d, opt_p):
+                    for group in opt.param_groups:
+                        group["lr"] = args.lr_min + 0.5 * (args.lr - args.lr_min) * (
+                            1.0 + math.cos(math.pi * progress)
+                        )
             if args.lambda_spk > 0.0:
                 for parameter in probe.parameters():
                     parameter.requires_grad_(True)
@@ -634,6 +705,9 @@ def main(argv: list[str] | None = None) -> int:
                 "adv": loss_adv.item(),
                 "mel": loss_mel.item(),
                 "fm": loss_fm.item(),
+                "detail": loss_detail.item(),
+                "ms": loss_ms.item(),
+                "gv": loss_gv.item(),
                 "spk": loss_spk.item(),
                 "probe": probe_value,
                 "d_real": real_logits.mean().item(),
@@ -648,7 +722,7 @@ def main(argv: list[str] | None = None) -> int:
                     f"epoch {epoch:>3}/{args.epochs}  step {step:>4}/{steps_per_epoch}  "
                     f"| D {values['d']:7.4f} (real {values['d_real']:6.3f} fake {values['d_fake']:6.3f})  "
                     f"| G {values['g']:8.4f} (adv {values['adv']:7.4f} mel {values['mel']:.4f} "
-                    f"fm {values['fm']:7.4f} "
+                    f"det {values['detail']:.4f} fm {values['fm']:7.4f} "
                     + (f"spk {values['spk']:.3f} probe {values['probe']:.3f}" if args.lambda_spk > 0 else "spk off")
                     + ")"
                 )
@@ -667,7 +741,9 @@ def main(argv: list[str] | None = None) -> int:
         elapsed = time.perf_counter() - epoch_start
         print(
             f"  -> epoch {epoch:>3} summary: D {epoch_stats['d']:.4f} | G {epoch_stats['g']:.4f} "
-            f"(adv {epoch_stats['adv']:+.4f}, mel {epoch_stats['mel']:.4f}, fm {epoch_stats['fm']:.4f}, "
+            f"(adv {epoch_stats['adv']:+.4f}, mel {epoch_stats['mel']:.4f}, "
+            f"det {epoch_stats['detail']:.4f} (ms {epoch_stats['ms']:.4f}/gv {epoch_stats['gv']:.4f}), "
+            f"fm {epoch_stats['fm']:.4f}, "
             + (f"spk {epoch_stats['spk']:.3f}, probe {epoch_stats['probe']:.3f}" if args.lambda_spk > 0 else "spk off")
             + ") "
             f"| {steps / elapsed:.1f} steps/s"
@@ -759,6 +835,8 @@ def main(argv: list[str] | None = None) -> int:
               f"in {total_time:.1f}s")
     print(f"  adv loss   : {first['adv']:+.4f} -> {last['adv']:+.4f}")
     print(f"  mel L1     : {first['mel']:.4f} -> {last['mel']:.4f}")
+    print(f"  detail     : {first['detail']:.4f} -> {last['detail']:.4f}   "
+          f"(multi-scale {first['ms']:.4f}->{last['ms']:.4f}, global-var {first['gv']:.4f}->{last['gv']:.4f})")
     print(f"  feature mt : {first['fm']:.4f} -> {last['fm']:.4f}")
     if args.lambda_spk > 0:
         print(f"  spk loss   : {first['spk']:.4f} -> {last['spk']:.4f}   (1 - cos; lower = output carries the target voice)")

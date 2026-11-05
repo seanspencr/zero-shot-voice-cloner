@@ -8,3 +8,10 @@ pretrained/*
 logs/*
 .reasonix/*
 samples/*
+**.wav
+preview_after/**
+__pycache__/
+*.pyc
+*.log
+eval_out*/
+diagnose_out*/

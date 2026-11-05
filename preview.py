@@ -160,7 +160,8 @@ def main(argv: list[str] | None = None) -> int:
 
     started = time.perf_counter()
     with torch.no_grad():
-        mel_pred = generator(content, speaker_vec)
+        f0 = sample["f0"].unsqueeze(0).to(device) if "f0" in sample else None
+        mel_pred = generator(content, speaker_vec, f0)
     gen_seconds = time.perf_counter() - started
     wav_gen = vocoder.forward(mel_pred)[0, 0].detach().cpu().numpy()
 
