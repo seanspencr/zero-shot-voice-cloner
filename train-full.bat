@@ -46,7 +46,8 @@ echo  WARNING: HuBERT currently runs on the fly, so this is CPU-bound.
 echo  There is no resume: if you stop, completed-epoch checkpoints are kept
 echo  but a new run starts from scratch. Consider train-medium.bat first, or
 echo  asking for the feature cache to speed this up 2-3x.
-echo  Whole-corpus cache is ~46 GB; with 51 GB free prefer build-cache.bat --max-utterances 12000.
+echo  Whole-corpus cache is ~46 GB; with 51 GB free prefer build-cache.bat --max-utterances 12000.
+
 echo  Extra args: %*
 echo ==========================================================================
 echo.
@@ -61,7 +62,7 @@ if /i not "%CONFIRM%"=="YES" (
 
 REM python's stderr is merged and stringified so PowerShell does not wrap it in
 REM NativeCommandError records; Tee keeps the console live and writes the log.
-powershell -NoProfile -ExecutionPolicy Bypass -Command "& '%PY%' -u train.py --data libritts --content-source hubert --speaker-source xtts --segment-seconds 4.0 --batch-size 4 --epochs 2 --cache-dir datasets\cache\hubert-L9 --val-split dev-clean --val-every 1 --val-utterances 40 --render-every 1 --log-every 200 --save-dir checkpoints %* 2>&1 | ForEach-Object { $_.ToString() } | Tee-Object -FilePath '%LOG%'; exit $LASTEXITCODE"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "& '%PY%' -u train.py --data libritts --content-source hubert --speaker-source xtts --segment-seconds 4.0 --batch-size 4 --d-every 2 --epochs 2 --cache-dir datasets\cache\hubert-L9 --val-split dev-clean --val-every 1 --val-utterances 40 --render-every 1 --log-every 200 --save-dir checkpoints %* 2>&1 | ForEach-Object { $_.ToString() } | Tee-Object -FilePath '%LOG%'; exit $LASTEXITCODE"
 set "RC=%ERRORLEVEL%"
 
 echo.

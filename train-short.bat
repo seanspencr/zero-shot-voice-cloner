@@ -41,14 +41,15 @@ echo    val      : dev-clean, 16 utterances each epoch
 echo    stops    : after 10 minutes (--max-minutes 10)
 echo    log      : %LOG%
 echo  Expect ~200 steps; mel L1 should fall from ~2.0 to ~1.0.
-echo  At ~1.2 steps/s once cached this is a quick sanity run, not a convergence run.
+echo  At ~1.2 steps/s once cached this is a quick sanity run, not a convergence run.
+
 echo  Extra args: %*
 echo ==========================================================================
 echo.
 
 REM python's stderr is merged and stringified so PowerShell does not wrap it in
 REM NativeCommandError records; Tee keeps the console live and writes the log.
-powershell -NoProfile -ExecutionPolicy Bypass -Command "& '%PY%' -u train.py --data libritts --content-source hubert --speaker-source xtts --segment-seconds 4.0 --batch-size 4 --max-utterances 800 --epochs 4 --cache-dir datasets\cache\hubert-L9 --val-split dev-clean --val-every 1 --val-utterances 16 --render-every 1 --log-every 25 --save-dir checkpoints --max-minutes 10 %* 2>&1 | ForEach-Object { $_.ToString() } | Tee-Object -FilePath '%LOG%'; exit $LASTEXITCODE"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "& '%PY%' -u train.py --data libritts --content-source hubert --speaker-source xtts --segment-seconds 4.0 --batch-size 4 --d-every 2 --max-utterances 800 --epochs 4 --cache-dir datasets\cache\hubert-L9 --val-split dev-clean --val-every 1 --val-utterances 16 --render-every 1 --log-every 25 --save-dir checkpoints --max-minutes 10 %* 2>&1 | ForEach-Object { $_.ToString() } | Tee-Object -FilePath '%LOG%'; exit $LASTEXITCODE"
 set "RC=%ERRORLEVEL%"
 
 echo.

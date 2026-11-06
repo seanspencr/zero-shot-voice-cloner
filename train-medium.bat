@@ -41,7 +41,8 @@ echo    time     : about 1.3 hours on this CPU (~4.4 s per step)
 echo    log      : %LOG%
 echo  No time limit is set. Close the window or press Ctrl+C to stop;
 echo  checkpoints from completed epochs stay on disk (there is no resume yet).
-echo  ~1.7 h after build-cache.bat has cached 5000 utterances. Resumable with --resume.
+echo  ~1.7 h after build-cache.bat has cached 5000 utterances. Resumable with --resume.
+
 echo  Extra args: %*
 echo ==========================================================================
 echo.
@@ -56,7 +57,7 @@ if /i not "%CONFIRM%"=="YES" (
 
 REM python's stderr is merged and stringified so PowerShell does not wrap it in
 REM NativeCommandError records; Tee keeps the console live and writes the log.
-powershell -NoProfile -ExecutionPolicy Bypass -Command "& '%PY%' -u train.py --data libritts --content-source hubert --speaker-source xtts --segment-seconds 4.0 --batch-size 4 --max-utterances 5000 --epochs 6 --cache-dir datasets\cache\hubert-L9 --val-split dev-clean --val-every 2 --val-utterances 32 --render-every 1 --log-every 100 --save-dir checkpoints %* 2>&1 | ForEach-Object { $_.ToString() } | Tee-Object -FilePath '%LOG%'; exit $LASTEXITCODE"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "& '%PY%' -u train.py --data libritts --content-source hubert --speaker-source xtts --segment-seconds 4.0 --batch-size 4 --d-every 2 --max-utterances 5000 --epochs 6 --cache-dir datasets\cache\hubert-L9 --val-split dev-clean --val-every 2 --val-utterances 32 --render-every 1 --log-every 100 --save-dir checkpoints %* 2>&1 | ForEach-Object { $_.ToString() } | Tee-Object -FilePath '%LOG%'; exit $LASTEXITCODE"
 set "RC=%ERRORLEVEL%"
 
 echo.

@@ -217,6 +217,7 @@ class LibriTTSDataset(Dataset[LibriTTSSample]):
         cache_dir: str | Path | None = None,
         content_source: str = "mel-projection",
         hubert_layer: int = 9,
+        augment: float = 0.0,
     ) -> None:
         if not utterances:
             raise ValueError("no utterances: check the root/split/limit arguments")
@@ -237,6 +238,10 @@ class LibriTTSDataset(Dataset[LibriTTSSample]):
         self.cache_dir = Path(cache_dir) if cache_dir else None
         self.content_source = content_source
         self.hubert_layer = hubert_layer
+        # 0 = off. Otherwise: mask a random contiguous span of frames and add Gaussian noise to the
+        # content features (train split only). Acts like SpecAugment for the content path and is the
+        # cheapest lever against memorising the ~800 training clips.
+        self.augment = float(augment)
 
     def set_epoch(self, epoch: int) -> None:
         """Changes the random crop offsets between epochs."""
@@ -320,6 +325,7 @@ class LibriTTSDataset(Dataset[LibriTTSSample]):
             f0_np = np.pad(f0_np, ((0, n_frames - f0_np.shape[0]), (0, 0)))
 
         content = self.content_extractor.extract(wav, sr, mel_np, n_frames)  # [T, 768]
+        content, f0_np = self._augment(np.asarray(content, dtype=np.float32), f0_np, index)
         speaker = self.speaker_extractor.extract(wav, sr, mel_np)  # [D]
 
         if content.shape[0] != n_frames:
@@ -340,6 +346,25 @@ class LibriTTSDataset(Dataset[LibriTTSSample]):
             duration=total_seconds,
         )
 
+
+
+    # ------------------------------------------------------------------ augmentation
+    def _augment(self, content: np.ndarray, f0: np.ndarray, index: int) -> tuple[np.ndarray, np.ndarray]:
+        """Mask a random frame span and add Gaussian noise to the content features (training only)."""
+        if self.augment <= 0.0 or not self.train:
+            return content, f0
+        rng = np.random.default_rng(self.seed * 7919 + self.epoch * 100003 + index)
+        frames = content.shape[0]
+        if frames > 8 and rng.random() < 0.5:
+            width = int(rng.integers(1, max(2, int(frames * self.augment * 2))))
+            start = int(rng.integers(0, frames - width))
+            content = content.copy()
+            f0 = f0.copy()
+            content[start:start + width] = 0.0
+            f0[start:start + width] = 0.0
+        scale = float(content.std()) + 1e-6
+        content = content + rng.normal(0.0, self.augment * scale, content.shape).astype(np.float32)
+        return content, f0
 
     # ------------------------------------------------------------------ cache reader
     def _from_cache(self, path: Path, item: Utterance, index: int) -> LibriTTSSample:
@@ -372,7 +397,8 @@ class LibriTTSDataset(Dataset[LibriTTSSample]):
 
         mel = mel_full[:, frame_start:frame_end]
         content = data["content"][frame_start:frame_end].astype(np.float32)
-        f0 = data["f0"][frame_start:frame_end]
+        f0 = data["f0"][frame_start:frame_end].astype(np.float32)
+        content, f0 = self._augment(content, f0, index)
         speaker = data["speaker"].astype(np.float32)
 
         # pad to a full segment (only possible for clips shorter than the segment)
@@ -403,6 +429,7 @@ class LibriTTSDataset(Dataset[LibriTTSSample]):
             f"speaker: {getattr(self.speaker_extractor, 'name', '?')}, "
             f"segment: {'full' if self.segment_seconds is None else f'{self.segment_seconds:g}s'}"
             + (", cache: on" if self.cache_dir is not None else ", cache: off")
+            + (f", augment: {self.augment:g}" if self.augment > 0 else "")
             + ")"
         )
 
@@ -431,6 +458,7 @@ def build_libritts_loader(
     shuffle_seed: int | None = 0,
     min_seconds: float = 0.0,
     cache_dir: str | Path | None = None,
+    augment: float = 0.0,
 ) -> tuple[LibriTTSDataset, DataLoader[LibriTTSSample]]:
     """Scan a split, build the extractors and wrap everything in a DataLoader.
 
@@ -461,6 +489,7 @@ def build_libritts_loader(
         cache_dir=cache_dir,
         content_source=content_source,
         hubert_layer=int((content_kwargs or {}).get("layer", 9)),
+        augment=augment,
     )
 
     shuffle_generator = torch.Generator()

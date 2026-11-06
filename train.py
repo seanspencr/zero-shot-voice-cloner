@@ -74,6 +74,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     data.add_argument("--split", default="train-clean-100", help="LibriTTS split to train on")
     data.add_argument("--max-utterances", type=int, default=None, help="cap utterance count (smoke runs)")
     data.add_argument(
+        "--augment",
+        type=float,
+        default=0.0,
+        help=(
+            "content-feature augmentation strength (0 = off): masks a random frame span and adds "
+            "Gaussian noise to the content features during training. Anti-overfit lever"
+        ),
+    )
+    data.add_argument(
         "--cache-dir",
         default=None,
         help=(
@@ -127,6 +136,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     model = parser.add_argument_group("model")
     model.add_argument("--hidden-dim", type=int, default=256, help="Generator channel width")
     model.add_argument("--num-blocks", type=int, default=4, help="number of AdaIN residual blocks")
+    model.add_argument(
+        "--dropout",
+        type=float,
+        default=0.0,
+        help="channel dropout inside the AdaIN residual blocks (0 = off); anti-overfit lever",
+    )
     model.add_argument("--d-channels", type=int, default=64, help="Discriminator base channels")
     model.add_argument("--d-layers", type=int, default=4, help="Discriminator downsampling layers")
 
@@ -139,8 +154,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     optim.add_argument(
         "--loss",
         choices=("hinge", "lsgan"),
-        default="hinge",
-        help="adversarial objective: hinge (early phase, collapse-resistant) or lsgan (late phase, smoothing)",
+        default="lsgan",
+        help=(
+            "adversarial objective. LSGAN (default) is non-saturating, so the generator keeps a gradient "
+            "even when the discriminator is winning. Hinge saturates: with D loss ~0.05 it gave G exactly "
+            "zero gradient, which is what stalled earlier runs (see decision.md S1)"
+        ),
     )
     optim.add_argument("--lambda-adv", type=float, default=1.0)
     optim.add_argument(
@@ -169,6 +188,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     optim.add_argument("--lambda-fm", type=float, default=2.0, help="weight of the feature matching loss")
+    optim.add_argument(
+        "--d-every",
+        type=int,
+        default=1,
+        help=(
+            "update the discriminator every N steps (G still updates every step). Raising it slows D down; "
+            "use it when D runs away, e.g. --d-every 2 (decision.md S3)"
+        ),
+    )
+    optim.add_argument(
+        "--early-stop-patience",
+        type=int,
+        default=3,
+        help=(
+            "stop after this many validations without val-MCD improvement (0 disables). Requires --val-every. "
+            "Earlier runs kept training past their optimum, so this is on by default (decision.md S2)"
+        ),
+    )
     optim.add_argument("--lr-min", type=float, default=1e-5, help="cosine-decay floor for the learning rate")
     optim.add_argument("--grad-clip", type=float, default=1.0, help="max grad norm (0 disables)")
     optim.add_argument("--grad-accum", type=int, default=1, help="micro-batches per optimizer step")
@@ -243,6 +280,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--max-minutes must be >= 0")
     if args.grad_accum < 1:
         parser.error("--grad-accum must be >= 1")
+    if args.d_every < 1:
+        parser.error("--d-every must be >= 1")
+    if args.early_stop_patience < 0:
+        parser.error("--early-stop-patience must be >= 0")
     if args.val_every < 0:
         parser.error("--val-every must be >= 0")
     if args.val_every > 0 and args.val_split is None:
@@ -331,6 +372,7 @@ def run_shape_sanity_check(
         mel_bins=args.mel_bins,
         num_blocks=args.num_blocks,
         speaker_dim=args.speaker_dim,
+        dropout=args.dropout,
     ).to(device)
     discriminator = PatchDiscriminator(
         mel_bins=args.mel_bins, channels=args.d_channels, n_layers=args.d_layers
@@ -510,6 +552,7 @@ def main(argv: list[str] | None = None) -> int:
                 train=True,
                 min_seconds=min_seconds,
                 cache_dir=args.cache_dir,
+                augment=args.augment,
                 content_source=args.content_source,
                 speaker_source=args.speaker_source,
                 content_kwargs={
@@ -548,6 +591,7 @@ def main(argv: list[str] | None = None) -> int:
         mel_bins=args.mel_bins,
         num_blocks=args.num_blocks,
         speaker_dim=args.speaker_dim,
+        dropout=args.dropout,
     ).to(device)
     discriminator = PatchDiscriminator(
         mel_bins=args.mel_bins,
@@ -565,11 +609,15 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Generator     : {count_parameters(generator):,} trainable parameters")
     print(f"Discriminator : {count_parameters(discriminator):,} trainable parameters")
     probe_state = f"lambda_spk={args.lambda_spk}" if args.lambda_spk > 0 else "OFF (--lambda-spk 0)"
+    print(f"Adversarial   : {args.loss}   D updated every {args.d_every} step(s)   "
+          f"early-stop patience={args.early_stop_patience} (val MCD)")
+    print(f"Best ckpt by  : {'val MCD' if args.val_every > 0 else 'training G loss (no validation configured)'}")
     print(f"Loss weights  : adv={args.lambda_adv} mel={args.lambda_mel} detail={args.lambda_detail} "
           f"fm={args.lambda_fm} spk={args.lambda_spk}")
     print(f"Regularisation: spectral_norm={'off' if args.no_spectral_norm else 'on'} "
           f"grad_clip={args.grad_clip} grad_accum={args.grad_accum} lr={args.lr}->{args.lr_min} (cosine)")
     print(f"Pitch stream  : {'off' if args.no_f0 else 'on (log-F0 contour + voiced flag, zero-init projection)'}")
+    print(f"Anti-overfit  : dropout={args.dropout} augment={args.augment} weight_decay={args.weight_decay}")
     print(f"Speaker probe : {count_parameters(probe):,} trainable parameters "
           f"({probe_state}, embed_dim={args.speaker_dim})")
     print()
@@ -605,6 +653,10 @@ def main(argv: list[str] | None = None) -> int:
     validation_history: list[dict[str, float]] = []
     rendered: list[str] = []
     best_g_total = math.inf
+    best_val_mcd = math.inf
+    best_val_epoch = 0
+    stale_validations = 0
+    early_stopped = False
     stopped_early = False
     start_time = time.perf_counter()
 
@@ -640,12 +692,14 @@ def main(argv: list[str] | None = None) -> int:
             real_logits = discriminator(mel_target)
             loss_d = adversarial_d_loss(real_logits, fake_logits, args.loss)
 
-            opt_d.zero_grad(set_to_none=True)
-            (loss_d / args.grad_accum).backward()
-            if step % args.grad_accum == 0 or step == steps_per_epoch:
-                if args.grad_clip > 0:
-                    torch.nn.utils.clip_grad_norm_(discriminator.parameters(), args.grad_clip)
-                opt_d.step()
+            update_d = (step % args.d_every == 0) or (step == steps_per_epoch)
+            if update_d:
+                opt_d.zero_grad(set_to_none=True)
+                (loss_d / args.grad_accum).backward()
+                if step % args.grad_accum == 0 or step == steps_per_epoch:
+                    if args.grad_clip > 0:
+                        torch.nn.utils.clip_grad_norm_(discriminator.parameters(), args.grad_clip)
+                    opt_d.step()
 
             # ---------------- Speaker probe step (on REAL mel only) ----------------
             # The probe learns to recover a speaker embedding from a real spectrogram. Keeping it fed
@@ -821,6 +875,18 @@ def main(argv: list[str] | None = None) -> int:
             report = compute_metrics(generator, val_dataset, vocoder, device, embedder=None)
             generator.train()
             validation_history.append({"epoch": epoch, "mcd": report.mcd_mean, "mel_l1": report.mel_l1_mean})
+            last_val_mcd = report.mcd_mean
+            if last_val_mcd < best_val_mcd - 1e-6:
+                best_val_mcd = last_val_mcd
+                best_val_epoch = epoch
+                stale_validations = 0
+            else:
+                stale_validations += 1
+                if args.early_stop_patience and stale_validations >= args.early_stop_patience:
+                    early_stopped = True
+            print(f"     best val MCD so far: {best_val_mcd:.3f} dB at epoch {best_val_epoch} "
+                  f"| stale validations: {stale_validations}"
+                  + (f"/{args.early_stop_patience}" if args.early_stop_patience else ""))
             print(
                 f"  -> val {args.val_split} @epoch {epoch}: MCD {report.mcd_mean:.3f} dB  "
                 f"| mel L1 {report.mel_l1_mean:.4f}  ({report.n_items} utterances)"
@@ -829,12 +895,22 @@ def main(argv: list[str] | None = None) -> int:
         if save_dir:
             save_checkpoint(os.path.join(save_dir, "latest.pt"), epoch, generator, discriminator, probe,
                             opt_g, opt_d, opt_p, args)
-            if epoch_stats["g"] < best_g_total:
+            # S2: prefer validation MCD over training loss -- training loss is lowest for the most
+            # overfitted epoch, which is exactly the checkpoint you do not want to keep.
+            if val_dataset is not None and math.isfinite(best_val_mcd) and best_val_epoch == epoch:
+                save_checkpoint(os.path.join(save_dir, "best.pt"), epoch, generator, discriminator, probe,
+                                opt_g, opt_d, opt_p, args)
+                print(f"  -> saved best checkpoint (val MCD {best_val_mcd:.3f} dB) to {os.path.abspath(save_dir)}")
+            elif val_dataset is None and epoch_stats["g"] < best_g_total:
                 best_g_total = epoch_stats["g"]
                 save_checkpoint(os.path.join(save_dir, "best.pt"), epoch, generator, discriminator, probe,
                                 opt_g, opt_d, opt_p, args)
                 print(f"  -> saved best checkpoint (G {best_g_total:.4f}) to {os.path.abspath(save_dir)}")
 
+        if early_stopped:
+            print(f"  -> early stop: val MCD has not improved for {stale_validations} validations "
+                  f"(best {best_val_mcd:.3f} dB at epoch {best_val_epoch})")
+            break
         if stopped_early:
             break
 

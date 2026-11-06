@@ -81,19 +81,28 @@ class AdaINResBlock(nn.Module):
     stack and the Generator output matches the target mel frame count exactly.
     """
 
-    def __init__(self, channels: int, speaker_dim: int, kernel_size: int = 3, slope: float = 0.2) -> None:
+    def __init__(
+        self,
+        channels: int,
+        speaker_dim: int,
+        kernel_size: int = 3,
+        slope: float = 0.2,
+        dropout: float = 0.0,
+    ) -> None:
         super().__init__()
         padding = (kernel_size - 1) // 2
         self.conv1 = nn.Conv1d(channels, channels, kernel_size=kernel_size, padding=padding)
         self.adain1 = AdaIN1d(channels, speaker_dim)
         self.conv2 = nn.Conv1d(channels, channels, kernel_size=kernel_size, padding=padding)
         self.adain2 = AdaIN1d(channels, speaker_dim)
+        # channel dropout: cheap regularisation against memorising individual training clips
+        self.drop = nn.Dropout1d(dropout) if dropout > 0 else nn.Identity()
         self.slope = slope
 
     def forward(self, x: torch.Tensor, speaker: torch.Tensor) -> torch.Tensor:
-        h = self.conv1(x)
+        h = self.drop(self.conv1(x))
         h = F.leaky_relu(self.adain1(h, speaker), self.slope)
-        h = self.conv2(h)
+        h = self.drop(self.conv2(h))
         h = self.adain2(h, speaker)
         return F.leaky_relu(h + x, self.slope)
 
@@ -118,6 +127,7 @@ class Generator(nn.Module):
         num_blocks: int = 4,
         speaker_dim: int = 256,
         slope: float = 0.2,
+        dropout: float = 0.0,
     ) -> None:
         super().__init__()
         self.in_dim = in_dim
@@ -127,7 +137,7 @@ class Generator(nn.Module):
         self.conv_in = nn.Conv1d(in_dim, hidden_dim, kernel_size=7, padding=3)
         self.adain_in = AdaIN1d(hidden_dim, speaker_dim)
         self.blocks = nn.ModuleList(
-            AdaINResBlock(hidden_dim, speaker_dim) for _ in range(num_blocks)
+            AdaINResBlock(hidden_dim, speaker_dim, dropout=dropout) for _ in range(num_blocks)
         )
         self.conv_out = nn.Conv1d(hidden_dim, mel_bins, kernel_size=7, padding=3)
         # optional pitch stream (log-F0 contour + voiced flag), added to the content projection.
