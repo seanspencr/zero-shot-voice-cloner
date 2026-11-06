@@ -56,7 +56,7 @@ if /i not "%CONFIRM%"=="YES" (
 
 :cache
 echo === [1/2] feature cache: %N% utterances ===
-powershell -NoProfile -ExecutionPolicy Bypass -Command "& '%PY%' -u cache.py --split train-clean-100 --libritts-root datasets\libritts --max-utterances %N% --content-source hubert --hubert-layer 9 2>&1 | ForEach-Object { $_.ToString() } | Tee-Object -FilePath '%LOGC%'; exit $LASTEXITCODE"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "& '%PY%' -u cache.py --split train-clean-100 --libritts-root datasets\libritts --max-utterances %N% --content-source hubert --hubert-layer 9 --scan-jobs 16 2>&1 | ForEach-Object { $_.ToString() } | Tee-Object -FilePath '%LOGC%'; exit $LASTEXITCODE"
 set "RC=%ERRORLEVEL%"
 if not "%RC%"=="0" (
     echo [ERROR] cache build failed with %RC%. Re-run the same command; it resumes.

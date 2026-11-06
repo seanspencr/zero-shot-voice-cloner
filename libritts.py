@@ -28,6 +28,7 @@ from __future__ import annotations
 import json
 import math
 import random
+from concurrent.futures import ThreadPoolExecutor
 import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -103,6 +104,7 @@ def scan_split(
     shuffle_seed: int | None = 0,
     use_cache: bool = True,
     probe_duration: bool | None = None,
+    probe_jobs: int = 8,
 ) -> list[Utterance]:
     """Scan ``<root>/<split>`` into a deterministic list of utterances.
 
@@ -115,6 +117,9 @@ def scan_split(
         probe_duration: read each wav's duration with ``soundfile.info``. ``None`` means "only when a
             duration filter is set", which keeps a full-corpus scan at a few seconds instead of
             opening 33k files.
+        probe_jobs: threads used for the duration probe. It is pure I/O (open, read header, close), so
+            threads help a lot: a serial probe of train-clean-100 takes ~15+ minutes before the first
+            byte of training data is produced, and it has to finish before ``limit`` is applied.
 
     A JSON manifest cache is written to ``datasets/manifests/<split>_<filters>.json`` so repeated runs
     are instant.
@@ -142,39 +147,62 @@ def scan_split(
 
     items: list[Utterance] = []
     skipped_orphans = 0
+    candidates: list[tuple[Path, str, str, str, str]] = []  # wav, utt_id, speaker, chapter, text
     for wav_path in sorted(split_dir.rglob("*.wav")):
         utt_id = wav_path.stem
         match = _UTT_RE.match(utt_id)
         if match is None:
             continue
-        speaker_id, chapter_id = match.group(1), match.group(2)
         text_path = wav_path.with_name(f"{utt_id}.normalized.txt")
         if not text_path.is_file():
             skipped_orphans += 1
             continue
-        duration = 0.0
-        if probe_duration:
-            try:
-                info = sf.info(str(wav_path))
-            except Exception:  # unreadable file: skip rather than crash a long scan
+        candidates.append((wav_path, utt_id, match.group(1), match.group(2), _read_text(text_path)))
+
+    def _probe(path: str) -> float | None:
+        try:
+            info = sf.info(path)
+        except Exception:  # unreadable file: skip rather than crash a long scan
+            return None
+        return info.frames / info.samplerate if info.samplerate else 0.0
+
+    if probe_duration:
+        # I/O-bound: probe in parallel, then apply the duration filter to the results.
+        workers = max(1, min(int(probe_jobs), 32))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            probed = list(pool.map(_probe, [str(entry[0]) for entry in candidates]))
+        for (wav_path, utt_id, speaker_id, chapter_id, text), duration in zip(candidates, probed):
+            if duration is None:
                 skipped_orphans += 1
                 continue
-            duration = info.frames / info.samplerate if info.samplerate else 0.0
             if duration < min_seconds:
                 continue
             if max_seconds is not None and duration > max_seconds:
                 continue
-        items.append(
-            Utterance(
-                utt_id=utt_id,
-                speaker_id=speaker_id,
-                chapter_id=chapter_id,
-                wav_path=str(wav_path),
-                text=_read_text(text_path),
-                split=split,
-                duration=float(duration),
+            items.append(
+                Utterance(
+                    utt_id=utt_id,
+                    speaker_id=speaker_id,
+                    chapter_id=chapter_id,
+                    wav_path=str(wav_path),
+                    text=text,
+                    split=split,
+                    duration=float(duration),
+                )
             )
-        )
+    else:
+        for wav_path, utt_id, speaker_id, chapter_id, text in candidates:
+            items.append(
+                Utterance(
+                    utt_id=utt_id,
+                    speaker_id=speaker_id,
+                    chapter_id=chapter_id,
+                    wav_path=str(wav_path),
+                    text=text,
+                    split=split,
+                    duration=0.0,
+                )
+            )
 
     if shuffle_seed is not None:
         # shuffle so that a small `limit` still covers many speakers

@@ -84,6 +84,7 @@ def build_cache(
     device: str = "cpu",
     min_seconds: float = 0.0,
     progress_every: int = 200,
+    scan_jobs: int = 8,
 ) -> Path:
     """Extract and store features for ``split``. Resumable: existing files are skipped."""
     import soundfile as sf
@@ -101,6 +102,7 @@ def build_cache(
         min_seconds=min_seconds,
         shuffle_seed=0,
         use_cache=True,
+        probe_jobs=scan_jobs,
     )
     out_dir = cache_dir_for(root, content_source, hubert_layer)
     content_extractor = build_content_extractor(
@@ -190,6 +192,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--min-seconds", type=float, default=4.0,
                    help="skip clips shorter than this (match --segment-seconds to avoid padding)")
     p.add_argument("--progress-every", type=int, default=200)
+    p.add_argument(
+        "--scan-jobs",
+        type=int,
+        default=8,
+        help="threads for the duration probe during the split scan (I/O bound; 1 = serial)",
+    )
     args = p.parse_args(argv)
 
     build_cache(
@@ -204,6 +212,7 @@ def main(argv: list[str] | None = None) -> int:
         vocoder_dir=args.vocoder_dir,
         device=args.device,
         min_seconds=args.min_seconds,
+        scan_jobs=args.scan_jobs,
         progress_every=args.progress_every,
     )
     return 0
