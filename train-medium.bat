@@ -57,7 +57,7 @@ if /i not "%CONFIRM%"=="YES" (
 
 REM python's stderr is merged and stringified so PowerShell does not wrap it in
 REM NativeCommandError records; Tee keeps the console live and writes the log.
-powershell -NoProfile -ExecutionPolicy Bypass -Command "& '%PY%' -u train.py --data libritts --content-source hubert --speaker-source xtts --segment-seconds 4.0 --batch-size 4 --d-every 2 --max-utterances 5000 --epochs 6 --cache-dir datasets\cache\hubert-L9 --val-split dev-clean --val-every 2 --val-utterances 32 --render-every 1 --log-every 100 --save-dir checkpoints %* 2>&1 | ForEach-Object { $_.ToString() } | Tee-Object -FilePath '%LOG%'; exit $LASTEXITCODE"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "& '%PY%' -u train.py --data libritts --content-source hubert --speaker-source xtts --segment-seconds 4.0 --batch-size 4 --d-every 1 --lambda-cep 5.0 --lambda-mel 10.0 --lambda-detail 2.0 --max-utterances 5000 --epochs 6 --cache-dir datasets\cache\hubert-L9 --val-split dev-clean --val-every 2 --val-utterances 32 --render-every 1 --log-every 100 --save-dir checkpoints %* 2>&1 | ForEach-Object { $_.ToString() } | Tee-Object -FilePath '%LOG%'; exit $LASTEXITCODE"
 set "RC=%ERRORLEVEL%"
 
 echo.

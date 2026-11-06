@@ -25,7 +25,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-__all__ = ["multi_scale_mel_loss", "global_variance_loss", "SpectralDetailLoss"]
+__all__ = ["multi_scale_mel_loss", "global_variance_loss", "SpectralDetailLoss", "cepstral_loss"]
 
 
 def multi_scale_mel_loss(
@@ -82,3 +82,33 @@ class SpectralDetailLoss(torch.nn.Module):
         ms = multi_scale_mel_loss(pred, target, self.scales)
         gv = global_variance_loss(pred, target)
         return ms + self.gv_weight * gv, ms, gv
+
+def _dct_matrix(n_mels: int) -> torch.Tensor:
+    """Orthonormal DCT-II basis ``[n_mels, n_mels]`` (same transform `metrics.py` uses for MCD)."""
+    import numpy as np
+    from scipy.fftpack import dct
+
+    basis = dct(np.eye(n_mels), type=2, axis=0, norm="ortho").astype("float32")
+    return torch.from_numpy(basis)
+
+
+def cepstral_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    n_cepstra: int = 13,
+) -> torch.Tensor:
+    """L1 between mel-cepstra ``c1..cN`` of prediction and target.
+
+    Why: MCD -- the headline evaluation metric -- is computed on mel-cepstra, but training optimises
+    log-mel L1. Those disagree in practice (the model kept lowering mel L1 while MCD plateaued around
+    40 dB), because log-mel L1 weights every bin equally while cepstra emphasise the coarse spectral
+    envelope. This term puts the objective on the same axis as the metric.
+
+    ``c0`` (loudness) is dropped, matching :func:`metrics.mel_cepstral_distortion`.
+    """
+    if pred.shape[1] != target.shape[1]:
+        raise ValueError(f"mel bin mismatch: {pred.shape} vs {target.shape}")
+    matrix = _dct_matrix(pred.shape[1]).to(pred.device)  # [n_mels, n_mels]
+    cep_pred = torch.einsum("mk,bkt->bmt", matrix, pred)[:, 1:n_cepstra + 1]
+    cep_target = torch.einsum("mk,bkt->bmt", matrix, target)[:, 1:n_cepstra + 1]
+    return F.l1_loss(cep_pred, cep_target)

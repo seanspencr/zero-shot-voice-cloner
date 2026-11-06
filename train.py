@@ -47,7 +47,7 @@ from features import (
 )
 from libritts import DEFAULT_ROOT as DEFAULT_LIBRITTS_ROOT
 from libritts import build_libritts_loader, split_summary
-from losses import SpectralDetailLoss
+from losses import SpectralDetailLoss, cepstral_loss
 from models import Generator, PatchDiscriminator, SpeakerProbe, count_parameters, init_weights
 from vocoder import DEFAULT_MODEL_DIR, HiFiGANVocoder, load_vocoder, missing_checkpoint_help, vocoder_ready
 
@@ -169,6 +169,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=(
             "weight of the plain L1 mel loss. Was 45 (a *vocoder* recipe); at 45 the reconstruction term "
             "dominates and the generator converges to a blurred, 'buzzy' average -- see improvement-plan 1.1"
+        ),
+    )
+    optim.add_argument(
+        "--lambda-cep",
+        type=float,
+        default=0.0,
+        help=(
+            "weight of the mel-cepstral L1 term (c1..c13). Puts the training objective on the same axis "
+            "as the MCD evaluation metric (decision3.md T1)"
         ),
     )
     optim.add_argument(
@@ -612,7 +621,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Adversarial   : {args.loss}   D updated every {args.d_every} step(s)   "
           f"early-stop patience={args.early_stop_patience} (val MCD)")
     print(f"Best ckpt by  : {'val MCD' if args.val_every > 0 else 'training G loss (no validation configured)'}")
-    print(f"Loss weights  : adv={args.lambda_adv} mel={args.lambda_mel} detail={args.lambda_detail} "
+    print(f"Loss weights  : adv={args.lambda_adv} mel={args.lambda_mel} cep={args.lambda_cep} detail={args.lambda_detail} "
           f"fm={args.lambda_fm} spk={args.lambda_spk}")
     print(f"Regularisation: spectral_norm={'off' if args.no_spectral_norm else 'on'} "
           f"grad_clip={args.grad_clip} grad_accum={args.grad_accum} lr={args.lr}->{args.lr_min} (cosine)")
@@ -674,7 +683,7 @@ def main(argv: list[str] | None = None) -> int:
     for epoch in range(1, args.epochs + 1):
         dataset.set_epoch(epoch)
         epoch_start = time.perf_counter()
-        sums = {"d": 0.0, "g": 0.0, "adv": 0.0, "mel": 0.0, "fm": 0.0, "detail": 0.0, "ms": 0.0,
+        sums = {"d": 0.0, "g": 0.0, "adv": 0.0, "mel": 0.0, "fm": 0.0, "detail": 0.0, "cep": 0.0, "ms": 0.0,
                 "gv": 0.0, "spk": 0.0, "probe": 0.0, "d_real": 0.0, "d_fake": 0.0}
         steps = 0
 
@@ -736,6 +745,8 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 loss_detail = mel_pred.new_zeros(())
                 loss_ms = loss_gv = mel_pred.new_zeros(())
+            # cepstral term: same axis as the MCD metric (decision3.md T1)
+            loss_cep = cepstral_loss(mel_pred, mel_target) if args.lambda_cep > 0 else mel_pred.new_zeros(())
             # Speaker-consistency loss: the frozen probe must recover the *requested* embedding from
             # the generated spectrogram. Gradients flow into G through the probe's frozen weights.
             if args.lambda_spk > 0.0:
@@ -748,6 +759,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.lambda_adv * loss_adv
                 + args.lambda_mel * loss_mel
                 + args.lambda_detail * loss_detail
+                + args.lambda_cep * loss_cep
                 + args.lambda_fm * loss_fm
                 + args.lambda_spk * loss_spk
             )
@@ -776,6 +788,7 @@ def main(argv: list[str] | None = None) -> int:
                 "mel": loss_mel.item(),
                 "fm": loss_fm.item(),
                 "detail": loss_detail.item(),
+                "cep": loss_cep.item(),
                 "ms": loss_ms.item(),
                 "gv": loss_gv.item(),
                 "spk": loss_spk.item(),
@@ -792,7 +805,7 @@ def main(argv: list[str] | None = None) -> int:
                     f"epoch {epoch:>3}/{args.epochs}  step {step:>4}/{steps_per_epoch}  "
                     f"| D {values['d']:7.4f} (real {values['d_real']:6.3f} fake {values['d_fake']:6.3f})  "
                     f"| G {values['g']:8.4f} (adv {values['adv']:7.4f} mel {values['mel']:.4f} "
-                    f"det {values['detail']:.4f} fm {values['fm']:7.4f} "
+                    f"det {values['detail']:.4f} cep {values['cep']:.4f} fm {values['fm']:7.4f} "
                     + (f"spk {values['spk']:.3f} probe {values['probe']:.3f}" if args.lambda_spk > 0 else "spk off")
                     + ")"
                 )
